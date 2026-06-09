@@ -1,6 +1,7 @@
 import os
 import uuid
 import shutil
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -96,7 +97,7 @@ async def lifespan(app: FastAPI):
     inicializar_tablas_desde_la_api()
     yield
 
-app = FastAPI(title="SaaS Orchestrator Core API", version="3.3.0", lifespan=lifespan)
+app = FastAPI(title="SaaS Orchestrator Core API", version="3.4.0", lifespan=lifespan)
 
 # Mapear los headers con Prefer para el resto de endpoints REST estándar (PostgREST)
 HEADERS_REST = HEADERS_SUPABASE.copy()
@@ -149,12 +150,28 @@ async def stream_database_httpfs(token: str, db_name: str):
 
 @app.get("/api/system/path")
 async def obtener_ruta_servidor():
-    """Retorna la ruta física absoluta para el canal rápido SFTP/SSH."""
-    return {
-        "status": "success",
-        "explicacion": "Apunta tu cliente SFTP/SSH a esta ruta exacta de tu VPS para inyectar archivos de forma directa",
-        "ruta_vps_fija_absoluta": "/var/lib/docker/volumes/supabase_storage-api/_data/databases/"
-    }
+    """
+    🔍 INSPECTOR DE SISTEMA DINÁMICO:
+    Averigua en tiempo de ejecución la ubicación física real y absoluta
+    dentro del entorno donde está montado el sistema de archivos del contenedor.
+    """
+    try:
+        path_real = Path(DB_DIR).resolve(strict=False)
+        if not path_real.exists():
+            path_real.mkdir(parents=True, exist_ok=True)
+            
+        return {
+            "status": "success",
+            "origen": "System OS Inspection (Dynamic)",
+            "ruta_absoluta_sistema": str(path_real),
+            "directorio_padre": str(path_real.parent),
+            "existe_en_disco": path_real.is_dir()
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "detail": f"No se pudo auditar el sistema de archivos de forma dinámica: {str(e)}"
+        }
 
 
 @app.get("/api/database/scan")
