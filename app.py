@@ -1,25 +1,22 @@
-"""
-Orchestrator Core API SaaS — Dashboard de Control
-Sistema: DuckDB + Supabase Hybrid Streamer v3.5.0
-"""
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
-import requests
-import json
+import requests, os, json, secrets, hashlib
+from datetime import datetime
 
-app = FastAPI(title="Orchestrator Core API", version="3.5.0")
+app = FastAPI(title="DuckDB Catalog API", version="4.0.0")
 
-# ──────────────────────────────────────────────────────────────
-# CONFIGURACIÓN CENTRAL
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# CONFIG CENTRAL
+# ─────────────────────────────────────────────────────────────
 SUPABASE_URL     = "http://skrifna-supabase-473c9f-192-129-183-187.sslip.io"
-DUCKDB_API_URL   = "http://skrifna-duckdb-zokthr-c57021-192-129-183-187.sslip.io"
 SERVICE_ROLE_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
     ".eyJpYXQiOjE3ODEwMTQzOTksImV4cCI6MTg5MzQ1NjAwMCwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlzcyI6InN1cGFiYXNlIn0"
     ".L4hICENRSDn6FRSX1YDj0dxYrnmIjEPsieqvCW8VMj4"
 )
+STORAGE_DIR = "/app/storage/databases"
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 HEADERS = {
     "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
@@ -27,779 +24,997 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+def sb_get(tabla, qs="?select=*"):
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{tabla}{qs}", headers=HEADERS, timeout=8)
+        return r.json() if r.ok else []
+    except:
+        return []
 
-# ──────────────────────────────────────────────────────────────
-# HTML: PÁGINA PRINCIPAL — DASHBOARD DE ESTADO
-# ──────────────────────────────────────────────────────────────
-HTML_DASHBOARD = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Orchestrator Core — Panel de Control</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+def sb_post(tabla, payload):
+    h = {**HEADERS, "Prefer": "return=representation"}
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{tabla}", headers=h, json=payload, timeout=8)
+        return r.status_code, r.json() if r.text else {}
+    except Exception as e:
+        return 500, {"error": str(e)}
 
-  :root {
-    --bg:      #0a0e1a;
-    --surface: #111827;
-    --border:  #1e2d45;
-    --accent:  #3b82f6;
-    --accent2: #06b6d4;
-    --ok:      #10b981;
-    --warn:    #f59e0b;
-    --err:     #ef4444;
-    --text:    #e2e8f0;
-    --muted:   #64748b;
-  }
+def sb_patch(tabla, qs, payload):
+    h = {**HEADERS, "Prefer": "return=representation"}
+    try:
+        r = requests.patch(f"{SUPABASE_URL}/rest/v1/{tabla}{qs}", headers=h, json=payload, timeout=8)
+        return r.status_code, r.json() if r.text else {}
+    except Exception as e:
+        return 500, {"error": str(e)}
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+def ejecutar_sql(query):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/sql", headers=HEADERS, json={"query": query}, timeout=10)
+    if r.status_code == 404:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/ejecutar_sql_remoto", headers=HEADERS, json={"query": query}, timeout=10)
+    return r.status_code, r.text
 
-  body {
-    font-family: 'Space Grotesk', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-  }
-
-  /* TOPBAR */
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 18px 32px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    position: sticky;
-    top: 0;
-    z-index: 100;
-  }
-  .topbar-brand {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 13px;
-    color: var(--accent);
-    letter-spacing: 0.08em;
-  }
-  .topbar-brand span { color: var(--muted); }
-  .topbar-nav a {
-    color: var(--muted);
-    text-decoration: none;
-    font-size: 13px;
-    margin-left: 24px;
-    transition: color .2s;
-  }
-  .topbar-nav a:hover { color: var(--text); }
-  .topbar-nav a.active { color: var(--accent); }
-
-  /* LAYOUT */
-  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
-  h1 { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
-  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 40px; }
-
-  /* STATUS GRID */
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; margin-bottom: 40px; }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 22px 20px;
-  }
-  .card-label { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
-  .card-value { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; }
-  .card-value.ok   { color: var(--ok); }
-  .card-value.warn { color: var(--warn); }
-  .card-value.err  { color: var(--err); }
-
-  /* SECTION */
-  .section-title {
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: .06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 14px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  /* CHECKS TABLE */
-  .checks { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
-  .checks th {
-    text-align: left;
-    font-size: 11px;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    color: var(--muted);
-    padding: 10px 14px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-  }
-  .checks td { padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 14px; }
-  .checks tr:hover td { background: rgba(59,130,246,.04); }
-  .badge {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .04em;
-  }
-  .badge-ok   { background: rgba(16,185,129,.15); color: var(--ok); }
-  .badge-err  { background: rgba(239,68,68,.15);  color: var(--err); }
-  .badge-pend { background: rgba(245,158,11,.15); color: var(--warn); }
-
-  /* BUTTON */
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 10px 20px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-    transition: opacity .2s;
-  }
-  .btn:hover { opacity: .85; }
-  .btn-primary { background: var(--accent);  color: #fff; }
-  .btn-cyan    { background: var(--accent2); color: #000; }
-  .btn-ghost   {
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid var(--border);
-  }
-
-  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 40px; }
-
-  /* LOG BOX */
-  .log-box {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 18px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    color: var(--muted);
-    line-height: 1.7;
-    min-height: 100px;
-    max-height: 280px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-  }
-  .log-ok   { color: var(--ok); }
-  .log-err  { color: var(--err); }
-  .log-info { color: var(--accent); }
-
-  /* SPINNER */
-  .spin {
-    display: inline-block;
-    width: 14px; height: 14px;
-    border: 2px solid rgba(255,255,255,.3);
-    border-top-color: #fff;
-    border-radius: 50%;
-    animation: spin .6s linear infinite;
-    vertical-align: middle;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-</style>
-</head>
-<body>
-
-<div class="topbar">
-  <div class="topbar-brand">ORCHESTRATOR <span>CORE API</span> — v3.5.0</div>
-  <nav class="topbar-nav">
-    <a href="/" class="active">Dashboard</a>
-    <a href="/tablas">Tablas</a>
-    <a href="/tokens">Tokens</a>
-    <a href="/databases">Databases</a>
-    <a href="/docs">API Docs</a>
-  </nav>
-</div>
-
-<div class="container">
-  <h1>Panel de Control del Sistema</h1>
-  <p class="subtitle">Estado en tiempo real · Supabase + DuckDB Hybrid Streamer</p>
-
-  <div class="grid" id="statsGrid">
-    <div class="card"><div class="card-label">Supabase API</div><div class="card-value warn" id="statSupabase">verificando…</div></div>
-    <div class="card"><div class="card-label">DuckDB API</div><div class="card-value warn" id="statDuckdb">verificando…</div></div>
-    <div class="card"><div class="card-label">Tabla metadata_dbs</div><div class="card-value warn" id="statDbs">verificando…</div></div>
-    <div class="card"><div class="card-label">Tabla metadata_tokens</div><div class="card-value warn" id="statTokens">verificando…</div></div>
-  </div>
-
-  <p class="section-title">Chequeos de Infraestructura</p>
-  <table class="checks" id="checksTable">
-    <thead><tr><th>Servicio</th><th>Endpoint</th><th>Estado</th><th>Detalles</th></tr></thead>
-    <tbody id="checksBody">
-      <tr><td colspan="4" style="color:var(--muted);padding:20px 14px">Ejecutando chequeos…</td></tr>
-    </tbody>
-  </table>
-
-  <p class="section-title">Acciones Rápidas</p>
-  <div class="actions">
-    <button class="btn btn-primary" onclick="runChecks()">⟳ Re-chequear sistema</button>
-    <button class="btn btn-cyan"    onclick="crearTablas()">+ Crear tablas base</button>
-    <button class="btn btn-ghost"   onclick="window.location='/tablas'">Ver tablas →</button>
-  </div>
-
-  <p class="section-title">Log de Operaciones</p>
-  <div class="log-box" id="logBox">Esperando acciones del operador…\n</div>
-</div>
-
-<script>
-const log = (msg, cls='') => {
-  const box = document.getElementById('logBox');
-  const line = document.createElement('span');
-  if (cls) line.className = cls;
-  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
-  box.appendChild(line);
-  box.scrollTop = box.scrollHeight;
-};
-
-async function runChecks() {
-  document.getElementById('checksBody').innerHTML =
-    '<tr><td colspan="4" style="color:var(--muted);padding:20px 14px">Ejecutando…</td></tr>';
-  log('Iniciando chequeo de infraestructura…', 'log-info');
-
-  const res = await fetch('/api/check');
-  const data = await res.json();
-
-  let html = '';
-  data.checks.forEach(c => {
-    const badge = c.ok
-      ? '<span class="badge badge-ok">OK</span>'
-      : '<span class="badge badge-err">ERROR</span>';
-    html += `<tr>
-      <td>${c.nombre}</td>
-      <td style="font-family:monospace;font-size:12px;color:var(--muted)">${c.endpoint}</td>
-      <td>${badge}</td>
-      <td style="font-size:13px;color:var(--muted)">${c.detalle}</td>
-    </tr>`;
-    log(`${c.nombre}: ${c.detalle}`, c.ok ? 'log-ok' : 'log-err');
-  });
-  document.getElementById('checksBody').innerHTML = html;
-
-  // Update stat cards
-  const map = {
-    'Supabase REST': 'statSupabase',
-    'DuckDB API':    'statDuckdb',
-    'metadata_dbs':  'statDbs',
-    'metadata_tokens':'statTokens',
-  };
-  data.checks.forEach(c => {
-    const id = map[c.nombre];
-    if (!id) return;
-    const el = document.getElementById(id);
-    el.textContent = c.ok ? 'ONLINE' : 'ERROR';
-    el.className = 'card-value ' + (c.ok ? 'ok' : 'err');
-  });
-}
-
-async function crearTablas() {
-  log('Enviando comando para crear tablas base…', 'log-info');
-  const res  = await fetch('/api/crear-tablas', { method: 'POST' });
-  const data = await res.json();
-  data.resultados.forEach(r => log(r.msg, r.ok ? 'log-ok' : 'log-err'));
-}
-
-// Auto-run on load
-window.onload = runChecks;
-</script>
-</body>
-</html>
-"""
-
-# ──────────────────────────────────────────────────────────────
-# HTML: GESTIÓN DE TABLAS
-# ──────────────────────────────────────────────────────────────
-HTML_TABLAS = """<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────
+# HTML PRINCIPAL — CATÁLOGO DE BASES DE DATOS
+# ─────────────────────────────────────────────────────────────
+HTML_INDEX = r"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>Orchestrator — Tablas</title>
+<title>DuckDB Catalog — Orchestrator</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
-  :root{--bg:#0a0e1a;--surface:#111827;--border:#1e2d45;--accent:#3b82f6;--accent2:#06b6d4;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--text:#e2e8f0;--muted:#64748b;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
-  .topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100;}
-  .topbar-brand{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--accent);letter-spacing:.08em;}
-  .topbar-brand span{color:var(--muted);}
-  .topbar-nav a{color:var(--muted);text-decoration:none;font-size:13px;margin-left:24px;}
-  .topbar-nav a:hover{color:var(--text);}
-  .topbar-nav a.active{color:var(--accent);}
-  .container{max-width:1100px;margin:0 auto;padding:40px 24px;}
-  h1{font-size:26px;font-weight:700;margin-bottom:6px;}
-  .subtitle{color:var(--muted);font-size:14px;margin-bottom:40px;}
-  .section-title{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border);}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:20px;}
-  .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-  .form-group{display:flex;flex-direction:column;gap:6px;}
-  label{font-size:12px;color:var(--muted);letter-spacing:.04em;}
-  input,textarea,select{
-    background:var(--bg);border:1px solid var(--border);border-radius:6px;
-    color:var(--text);padding:10px 12px;font-size:13px;font-family:inherit;
-    outline:none;transition:border-color .2s;
-  }
-  input:focus,textarea:focus{border-color:var(--accent);}
-  textarea{resize:vertical;min-height:80px;font-family:'JetBrains Mono',monospace;font-size:12px;}
-  .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .2s;}
-  .btn:hover{opacity:.85;}
-  .btn-primary{background:var(--accent);color:#fff;}
-  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border);}
-  .btn-danger{background:rgba(239,68,68,.15);color:var(--err);border:1px solid rgba(239,68,68,.3);}
-  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
-  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
-  .badge-ok{background:rgba(16,185,129,.15);color:var(--ok);}
-  .badge-err{background:rgba(239,68,68,.15);color:var(--err);}
-  .result-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted);margin-top:14px;white-space:pre-wrap;max-height:200px;overflow-y:auto;display:none;}
-  .result-box.show{display:block;}
-  table{width:100%;border-collapse:collapse;margin-top:14px;}
-  th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:10px 14px;background:var(--surface);border-bottom:1px solid var(--border);}
-  td{padding:12px 14px;border-bottom:1px solid var(--border);font-size:13px;}
-  tr:hover td{background:rgba(59,130,246,.04);}
-  .mono{font-family:'JetBrains Mono',monospace;font-size:12px;}
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+:root{
+  --bg:#07080f;--surface:#0d1117;--card:#111827;
+  --border:#1a2332;--accent:#7c3aed;--accent2:#06b6d4;
+  --pink:#ec4899;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;
+  --text:#f1f5f9;--muted:#4b5563;--mono:'JetBrains Mono',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+
+/* TOP BAR */
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 28px;background:var(--surface);
+  border-bottom:1px solid var(--border);position:sticky;top:0;z-index:200;
+}
+.brand{font-family:var(--mono);font-size:12px;color:var(--accent2);letter-spacing:.12em;}
+.brand b{color:var(--text);}
+.nav{display:flex;gap:6px;}
+.nav a{
+  padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;
+  text-decoration:none;color:var(--muted);transition:all .2s;
+}
+.nav a:hover{color:var(--text);background:rgba(255,255,255,.05);}
+.nav a.active{color:var(--accent2);background:rgba(6,182,212,.08);}
+
+/* UPLOAD ZONE */
+.upload-zone{
+  margin:32px auto;max-width:1200px;padding:0 24px;
+}
+.upload-box{
+  border:2px dashed var(--border);border-radius:14px;
+  padding:40px;text-align:center;cursor:pointer;
+  transition:all .3s;background:rgba(124,58,237,.03);
+  position:relative;
+}
+.upload-box:hover,.upload-box.drag{
+  border-color:var(--accent);background:rgba(124,58,237,.06);
+}
+.upload-box input[type=file]{
+  position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;
+}
+.upload-icon{font-size:36px;margin-bottom:12px;opacity:.6;}
+.upload-title{font-size:16px;font-weight:600;margin-bottom:6px;}
+.upload-sub{font-size:13px;color:var(--muted);}
+.upload-progress{
+  display:none;margin-top:14px;background:rgba(255,255,255,.05);
+  border-radius:6px;overflow:hidden;height:6px;
+}
+.upload-progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0%;transition:width .3s;}
+
+/* SECTION HEADER */
+.section-header{
+  max-width:1200px;margin:0 auto;padding:0 24px 16px;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.section-title{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);}
+.filter-tabs{display:flex;gap:6px;}
+.filter-tab{
+  padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;
+  cursor:pointer;border:1px solid var(--border);color:var(--muted);
+  transition:all .2s;background:none;
+}
+.filter-tab:hover{color:var(--text);}
+.filter-tab.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+
+/* GRID DE CARDS */
+.grid{
+  max-width:1200px;margin:0 auto;padding:0 24px 60px;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:20px;
+}
+
+/* DB CARD */
+.db-card{
+  background:var(--card);border:1px solid var(--border);border-radius:14px;
+  overflow:hidden;transition:transform .2s,border-color .2s;position:relative;
+  cursor:default;
+}
+.db-card:hover{transform:translateY(-2px);border-color:rgba(124,58,237,.4);}
+
+/* CARD: imagen tipo la del mockup */
+.card-hero{
+  position:relative;height:180px;overflow:hidden;
+  background:linear-gradient(135deg,#1a0533 0%,#0a1628 50%,#180a2e 100%);
+}
+.card-hero img{width:100%;height:100%;object-fit:cover;opacity:.7;}
+.card-hero-gradient{
+  position:absolute;inset:0;
+  background:linear-gradient(to bottom,rgba(0,0,0,.1) 0%,rgba(0,0,0,.6) 100%);
+}
+.card-hero-title{
+  position:absolute;bottom:14px;left:16px;right:16px;
+  font-family:var(--mono);font-size:22px;font-weight:700;
+  text-shadow:0 2px 8px rgba(0,0,0,.8);letter-spacing:.06em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.card-connections{
+  position:absolute;top:12px;left:50%;transform:translateX(-50%);
+  background:rgba(0,0,0,.55);backdrop-filter:blur(8px);
+  border:1px solid rgba(255,255,255,.1);
+  padding:5px 16px;border-radius:20px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.08em;
+  white-space:nowrap;
+}
+.card-badge{
+  position:absolute;top:12px;right:12px;
+  background:rgba(0,0,0,.55);backdrop-filter:blur(8px);
+  border:1px solid rgba(255,255,255,.1);
+  padding:4px 10px;border-radius:6px;
+  font-family:var(--mono);font-size:10px;color:var(--accent2);
+}
+
+/* sin configurar: overlay reloj */
+.card-pending-overlay{
+  position:absolute;inset:0;
+  background:rgba(7,8,15,.75);backdrop-filter:blur(3px);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;
+}
+.clock-icon{font-size:40px;animation:pulse 2s ease-in-out infinite;}
+@keyframes pulse{0%,100%{opacity:.6;transform:scale(1);}50%{opacity:1;transform:scale(1.08);}}
+.pending-label{font-size:13px;font-weight:600;color:var(--warn);}
+.pending-sub{font-size:11px;color:var(--muted);text-align:center;padding:0 20px;}
+
+/* CARD BODY */
+.card-body{padding:16px;}
+.card-meta{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;
+}
+.card-size{font-family:var(--mono);font-size:11px;color:var(--muted);}
+.card-status-dot{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--ok);box-shadow:0 0 6px var(--ok);
+}
+.card-status-dot.pending{background:var(--warn);box-shadow:0 0 6px var(--warn);}
+
+/* CARD ACTIONS */
+.card-actions{display:flex;justify-content:center;gap:8px;}
+.action-btn{
+  width:44px;height:44px;border-radius:10px;border:none;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;font-size:18px;
+  background:rgba(255,255,255,.06);color:var(--muted);
+  transition:all .2s;position:relative;
+}
+.action-btn:hover{background:rgba(255,255,255,.12);color:var(--text);transform:scale(1.08);}
+.action-btn.primary{background:rgba(124,58,237,.2);color:var(--accent);}
+.action-btn.primary:hover{background:rgba(124,58,237,.35);}
+.action-btn[disabled]{opacity:.3;cursor:not-allowed;pointer-events:none;}
+.action-tip{
+  position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
+  background:#1e293b;border:1px solid var(--border);
+  padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;
+  white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .15s;
+  font-family:var(--mono);
+}
+.action-btn:hover .action-tip{opacity:1;}
+
+/* EMPTY STATE */
+.empty-state{
+  grid-column:1/-1;text-align:center;padding:80px 20px;
+  color:var(--muted);
+}
+.empty-state .empty-icon{font-size:52px;margin-bottom:16px;opacity:.4;}
+.empty-state p{font-size:15px;}
+
+/* MODAL */
+.modal-backdrop{
+  position:fixed;inset:0;background:rgba(0,0,0,.75);
+  backdrop-filter:blur(4px);z-index:500;
+  display:none;align-items:center;justify-content:center;padding:20px;
+}
+.modal-backdrop.show{display:flex;}
+.modal{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:16px;width:100%;max-width:480px;
+  box-shadow:0 24px 60px rgba(0,0,0,.6);overflow:hidden;
+}
+.modal-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:20px 24px 16px;border-bottom:1px solid var(--border);
+}
+.modal-title{font-size:15px;font-weight:700;}
+.modal-close{
+  background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:20px;line-height:1;padding:4px;border-radius:4px;
+}
+.modal-close:hover{color:var(--text);}
+.modal-body{padding:24px;}
+.modal-footer{
+  padding:16px 24px;border-top:1px solid var(--border);
+  display:flex;gap:10px;justify-content:flex-end;
+}
+
+/* FORMS */
+.form-group{display:flex;flex-direction:column;gap:6px;margin-bottom:16px;}
+label{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--muted);text-transform:uppercase;}
+input,textarea,select{
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  color:var(--text);padding:10px 14px;font-size:13px;font-family:'Space Grotesk',sans-serif;
+  outline:none;transition:border-color .2s;width:100%;
+}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);}
+textarea{resize:vertical;min-height:70px;font-family:var(--mono);font-size:12px;}
+.input-hint{font-size:11px;color:var(--muted);margin-top:4px;}
+
+/* BUTTONS */
+.btn{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;
+  cursor:pointer;border:none;transition:all .2s;white-space:nowrap;
+}
+.btn:hover{filter:brightness(1.1);}
+.btn:active{transform:scale(.97);}
+.btn-primary{background:var(--accent);color:#fff;}
+.btn-cyan{background:var(--accent2);color:#000;}
+.btn-ghost{background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--border);}
+.btn-danger{background:rgba(239,68,68,.15);color:var(--err);border:1px solid rgba(239,68,68,.2);}
+.btn-sm{padding:7px 14px;font-size:12px;}
+
+/* TOASTS */
+#toastContainer{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;}
+.toast{
+  display:flex;align-items:center;gap:10px;
+  padding:12px 18px;border-radius:10px;font-size:13px;font-weight:500;
+  border:1px solid;min-width:240px;max-width:360px;
+  animation:slideIn .25s ease;box-shadow:0 8px 24px rgba(0,0,0,.4);
+}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px);}to{opacity:1;transform:translateX(0);}}
+.toast-ok{background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.3);color:var(--ok);}
+.toast-err{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.3);color:var(--err);}
+.toast-info{background:rgba(6,182,212,.12);border-color:rgba(6,182,212,.3);color:var(--accent2);}
+
+/* TOKEN BOX */
+.token-display{
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:14px;font-family:var(--mono);font-size:12px;color:var(--ok);
+  word-break:break-all;line-height:1.6;margin-top:12px;
+  cursor:pointer;position:relative;transition:border-color .2s;
+}
+.token-display:hover{border-color:var(--ok);}
+.token-copy-label{
+  position:absolute;top:8px;right:10px;font-size:10px;color:var(--muted);
+}
+
+/* ESTRUCTURA TABLE */
+.struct-table{width:100%;border-collapse:collapse;margin-top:8px;}
+.struct-table th{
+  text-align:left;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);padding:8px 12px;border-bottom:1px solid var(--border);
+}
+.struct-table td{padding:9px 12px;border-bottom:1px solid rgba(26,35,50,.5);font-size:12px;}
+.struct-table tr:hover td{background:rgba(124,58,237,.05);}
+.type-pill{
+  display:inline-block;padding:2px 8px;border-radius:4px;
+  font-family:var(--mono);font-size:10px;font-weight:700;
+  background:rgba(6,182,212,.12);color:var(--accent2);
+}
+
+/* SPINNER */
+.spin{
+  display:inline-block;width:14px;height:14px;
+  border:2px solid rgba(255,255,255,.2);border-top-color:currentColor;
+  border-radius:50%;animation:spin .6s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* TABS en modal */
+.modal-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:20px;}
+.modal-tab{
+  padding:10px 16px;font-size:12px;font-weight:600;cursor:pointer;
+  color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:all .2s;
+}
+.modal-tab.active{color:var(--accent2);border-bottom-color:var(--accent2);}
+.tab-panel{display:none;}
+.tab-panel.active{display:block;}
 </style>
 </head>
 <body>
+
+<!-- TOPBAR -->
 <div class="topbar">
-  <div class="topbar-brand">ORCHESTRATOR <span>CORE API</span> — v3.5.0</div>
-  <nav class="topbar-nav">
-    <a href="/">Dashboard</a>
-    <a href="/tablas" class="active">Tablas</a>
-    <a href="/tokens">Tokens</a>
-    <a href="/databases">Databases</a>
+  <div class="brand"><b>DUCKDB</b> CATALOG — <span>ORCHESTRATOR v4.0</span></div>
+  <nav class="nav">
+    <a href="/" class="active">Catálogo</a>
+    <a href="/admin/tokens">Tokens</a>
+    <a href="/admin/setup">Setup</a>
     <a href="/docs">API Docs</a>
   </nav>
 </div>
 
-<div class="container">
-  <h1>Gestión de Tablas</h1>
-  <p class="subtitle">Crear tablas en Supabase y ejecutar SQL vía RPC tunnel</p>
-
-  <!-- CREAR TABLA CON SQL CUSTOM -->
-  <p class="section-title">Ejecutar SQL Personalizado (vía RPC ejecutar_sql_remoto)</p>
-  <div class="card">
-    <div class="form-group">
-      <label>QUERY SQL</label>
-      <textarea id="sqlQuery" placeholder="CREATE TABLE IF NOT EXISTS public.mi_tabla (&#10;  id BIGSERIAL PRIMARY KEY,&#10;  nombre TEXT NOT NULL,&#10;  creado_en TIMESTAMPTZ DEFAULT NOW()&#10;);"></textarea>
+<!-- UPLOAD ZONE -->
+<div class="upload-zone">
+  <div class="upload-box" id="uploadBox">
+    <input type="file" accept=".duckdb" id="fileInput" onchange="handleFileSelect(this)"/>
+    <div class="upload-icon">🦆</div>
+    <div class="upload-title">Arrastra un archivo .duckdb aquí</div>
+    <div class="upload-sub">o haz clic para seleccionar · Máximo 4 GB</div>
+    <div class="upload-progress" id="uploadProgress">
+      <div class="upload-progress-bar" id="uploadBar"></div>
     </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="ejecutarSQL()">▶ Ejecutar SQL</button>
-      <button class="btn btn-ghost" onclick="cargarEjemplo()">Cargar ejemplo</button>
-    </div>
-    <div class="result-box" id="sqlResult"></div>
-  </div>
-
-  <!-- VER DATOS DE TABLA -->
-  <p class="section-title">Leer Tabla (GET PostgREST)</p>
-  <div class="card">
-    <div class="form-row">
-      <div class="form-group">
-        <label>NOMBRE DE TABLA</label>
-        <input id="tablaLeer" placeholder="metadata_dbs" value="metadata_dbs"/>
-      </div>
-      <div class="form-group">
-        <label>FILTRO (opcional)</label>
-        <input id="tablaFiltro" placeholder="?select=*&limit=20" value="?select=*&limit=20"/>
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="leerTabla()">Leer tabla</button>
-    </div>
-    <div id="tablaResultContainer">
-      <div class="result-box" id="tablaResult"></div>
-    </div>
-  </div>
-
-  <!-- INSERTAR FILA -->
-  <p class="section-title">Insertar Fila (POST PostgREST)</p>
-  <div class="card">
-    <div class="form-row">
-      <div class="form-group">
-        <label>TABLA DESTINO</label>
-        <input id="insertTabla" placeholder="metadata_dbs" value="metadata_dbs"/>
-      </div>
-    </div>
-    <div class="form-group" style="margin-bottom:12px">
-      <label>PAYLOAD JSON</label>
-      <textarea id="insertPayload">{"nombre_db": "prueba.duckdb", "categoria": "test", "activo": true}</textarea>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="insertarFila()">+ Insertar fila</button>
-    </div>
-    <div class="result-box" id="insertResult"></div>
   </div>
 </div>
 
-<script>
-function mostrar(id, data, ok=true) {
-  const el = document.getElementById(id);
-  el.textContent = JSON.stringify(data, null, 2);
-  el.style.color = ok ? 'var(--ok)' : 'var(--err)';
-  el.classList.add('show');
-}
-
-function cargarEjemplo() {
-  document.getElementById('sqlQuery').value =
-    "CREATE TABLE IF NOT EXISTS public.proyectos (\\n  id BIGSERIAL PRIMARY KEY,\\n  nombre TEXT NOT NULL,\\n  descripcion TEXT,\\n  creado_en TIMESTAMPTZ DEFAULT NOW()\\n);";
-}
-
-async function ejecutarSQL() {
-  const query = document.getElementById('sqlQuery').value.trim();
-  if (!query) return alert('Escribe una query SQL');
-  const res  = await fetch('/api/sql', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({query})
-  });
-  const data = await res.json();
-  mostrar('sqlResult', data, res.ok);
-}
-
-async function leerTabla() {
-  const tabla   = document.getElementById('tablaLeer').value.trim();
-  const filtro  = document.getElementById('tablaFiltro').value.trim();
-  const res     = await fetch(`/api/tabla/${tabla}${filtro}`);
-  const data    = await res.json();
-  mostrar('tablaResult', data, res.ok);
-}
-
-async function insertarFila() {
-  const tabla   = document.getElementById('insertTabla').value.trim();
-  let payload;
-  try { payload = JSON.parse(document.getElementById('insertPayload').value); }
-  catch { return alert('JSON inválido en el payload'); }
-
-  const res  = await fetch(`/api/tabla/${tabla}`, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  mostrar('insertResult', data, res.ok);
-}
-</script>
-</body>
-</html>
-"""
-
-# ──────────────────────────────────────────────────────────────
-# HTML: GESTIÓN DE TOKENS
-# ──────────────────────────────────────────────────────────────
-HTML_TOKENS = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>Orchestrator — Tokens</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
-  :root{--bg:#0a0e1a;--surface:#111827;--border:#1e2d45;--accent:#3b82f6;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--text:#e2e8f0;--muted:#64748b;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
-  .topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100;}
-  .topbar-brand{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--accent);letter-spacing:.08em;}
-  .topbar-brand span{color:var(--muted);}
-  .topbar-nav a{color:var(--muted);text-decoration:none;font-size:13px;margin-left:24px;}
-  .topbar-nav a:hover{color:var(--text);}
-  .topbar-nav a.active{color:var(--accent);}
-  .container{max-width:1100px;margin:0 auto;padding:40px 24px;}
-  h1{font-size:26px;font-weight:700;margin-bottom:6px;}
-  .subtitle{color:var(--muted);font-size:14px;margin-bottom:40px;}
-  .section-title{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border);}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:20px;}
-  .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-  .form-group{display:flex;flex-direction:column;gap:6px;}
-  label{font-size:12px;color:var(--muted);letter-spacing:.04em;}
-  input,select{background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px 12px;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s;}
-  input:focus{border-color:var(--accent);}
-  .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .2s;}
-  .btn:hover{opacity:.85;}
-  .btn-primary{background:var(--accent);color:#fff;}
-  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border);}
-  .actions{display:flex;gap:10px;margin-top:14px;}
-  table{width:100%;border-collapse:collapse;}
-  th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);}
-  td{padding:12px 14px;border-bottom:1px solid var(--border);font-size:13px;}
-  tr:hover td{background:rgba(59,130,246,.04);}
-  .mono{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);}
-  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
-  .badge-ok{background:rgba(16,185,129,.15);color:var(--ok);}
-  .badge-warn{background:rgba(245,158,11,.15);color:var(--warn);}
-  .result-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ok);margin-top:14px;white-space:pre-wrap;display:none;}
-  .result-box.show{display:block;}
-  .empty{color:var(--muted);font-size:14px;padding:30px 0;text-align:center;}
-</style>
-</head>
-<body>
-<div class="topbar">
-  <div class="topbar-brand">ORCHESTRATOR <span>CORE API</span> — v3.5.0</div>
-  <nav class="topbar-nav">
-    <a href="/">Dashboard</a>
-    <a href="/tablas">Tablas</a>
-    <a href="/tokens" class="active">Tokens</a>
-    <a href="/databases">Databases</a>
-    <a href="/docs">API Docs</a>
-  </nav>
+<!-- SECTION HEADER -->
+<div class="section-header">
+  <span class="section-title">Bases de Datos Registradas</span>
+  <div class="filter-tabs">
+    <button class="filter-tab active" onclick="filtrar(this,'all')">Todas</button>
+    <button class="filter-tab" onclick="filtrar(this,'activo')">Activas</button>
+    <button class="filter-tab" onclick="filtrar(this,'pendiente')">Sin configurar</button>
+  </div>
 </div>
 
-<div class="container">
-  <h1>Gestión de Tokens de Acceso</h1>
-  <p class="subtitle">Registra y administra tokens de acceso para bots y clientes</p>
+<!-- GRID DE CARDS -->
+<div class="grid" id="dbGrid">
+  <div class="empty-state">
+    <div class="empty-icon">⏳</div>
+    <p>Cargando catálogo…</p>
+  </div>
+</div>
 
-  <p class="section-title">Registrar Nuevo Token</p>
-  <div class="card">
-    <div class="form-row">
+<!-- TOAST CONTAINER -->
+<div id="toastContainer"></div>
+
+<!-- ══════════════════════════════════════════════════════════
+     MODAL: CONFIGURAR DB
+═══════════════════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="modalConfig">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">⚙️ Configurar base de datos</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px" id="configDbName">—</div>
+      </div>
+      <button class="modal-close" onclick="closeModal('modalConfig')">✕</button>
+    </div>
+    <div class="modal-body">
       <div class="form-group">
-        <label>NOMBRE DEL BOT / CLIENTE</label>
-        <input id="tokenNombre" placeholder="bot_consulta_dni"/>
+        <label>Contraseña de acceso</label>
+        <input type="password" id="cfgPassword" placeholder="Contraseña que usarán los bots para conectarse"/>
+        <div class="input-hint">Esta contraseña se pedirá al descargar o conectar</div>
       </div>
       <div class="form-group">
-        <label>TOKEN</label>
-        <input id="tokenValor" placeholder="tk_xxxxxxxxxxxxx"/>
+        <label>Categoría</label>
+        <input id="cfgCategoria" placeholder="reniec, sunat, padron…"/>
+      </div>
+      <div class="form-group">
+        <label>URL de imagen de portada</label>
+        <input id="cfgImagen" placeholder="https://… (opcional)"/>
+      </div>
+      <div class="form-group">
+        <label>Descripción</label>
+        <textarea id="cfgDescripcion" placeholder="Describe qué contiene esta base de datos…"></textarea>
       </div>
     </div>
-    <div class="form-row">
+    <div class="modal-footer">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal('modalConfig')">Cancelar</button>
+      <button class="btn btn-primary btn-sm" onclick="guardarConfig()">✔ Guardar configuración</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     MODAL: GENERAR TOKEN
+═══════════════════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="modalToken">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">🔑 Generar token de acceso</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px" id="tokenDbName">—</div>
+      </div>
+      <button class="modal-close" onclick="closeModal('modalToken')">✕</button>
+    </div>
+    <div class="modal-body">
       <div class="form-group">
-        <label>PLAN</label>
-        <select id="tokenPlan">
-          <option value="basic">Basic</option>
-          <option value="pro">Pro</option>
-          <option value="enterprise">Enterprise</option>
+        <label>Nombre del cliente / bot</label>
+        <input id="tkNombre" placeholder="bot_consulta_reniec"/>
+      </div>
+      <div class="form-group">
+        <label>Contraseña de la base de datos</label>
+        <input type="password" id="tkPassword" placeholder="Para verificar que eres el dueño"/>
+      </div>
+      <div class="form-group">
+        <label>Plan de acceso</label>
+        <select id="tkPlan">
+          <option value="basic">Basic — 500 consultas/día</option>
+          <option value="pro">Pro — 5,000 consultas/día</option>
+          <option value="enterprise">Enterprise — Sin límite</option>
         </select>
       </div>
-      <div class="form-group">
-        <label>LÍMITE DIARIO (consultas)</label>
-        <input id="tokenLimite" type="number" placeholder="1000" value="1000"/>
+      <div id="tokenGenerado" style="display:none">
+        <label style="display:block;font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Token generado</label>
+        <div class="token-display" id="tokenValor" onclick="copiarToken()">
+          <span class="token-copy-label">clic para copiar</span>
+          —
+        </div>
+        <div style="font-size:11px;color:var(--warn);margin-top:8px">⚠️ Guarda este token ahora, no se puede recuperar luego</div>
       </div>
     </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="registrarToken()">+ Registrar token</button>
-      <button class="btn btn-ghost" onclick="generarToken()">⚡ Generar token aleatorio</button>
+    <div class="modal-footer">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal('modalToken')">Cerrar</button>
+      <button class="btn btn-primary btn-sm" id="btnGenerar" onclick="generarToken()">⚡ Generar token</button>
     </div>
-    <div class="result-box" id="tokenResult"></div>
   </div>
+</div>
 
-  <p class="section-title">Tokens Registrados</p>
-  <div class="card">
-    <div class="actions" style="margin-top:0;margin-bottom:14px">
-      <button class="btn btn-ghost" onclick="listarTokens()">⟳ Actualizar lista</button>
+<!-- ══════════════════════════════════════════════════════════
+     MODAL: ESTRUCTURA / ESQUEMA
+═══════════════════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="modalEstructura">
+  <div class="modal" style="max-width:620px">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">📊 Estructura de la base de datos</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px" id="estructuraDbName">—</div>
+      </div>
+      <button class="modal-close" onclick="closeModal('modalEstructura')">✕</button>
     </div>
-    <div id="tokensContainer">
-      <p class="empty">Haz clic en "Actualizar lista" para cargar los tokens</p>
+    <div class="modal-body" style="max-height:450px;overflow-y:auto">
+      <div class="modal-tabs">
+        <div class="modal-tab active" onclick="switchTab(this,'tabInfo')">Info</div>
+        <div class="modal-tab" onclick="switchTab(this,'tabTokens')">Tokens activos</div>
+      </div>
+      <div class="tab-panel active" id="tabInfo">
+        <div id="estructuraContent"><div style="text-align:center;padding:30px;color:var(--muted)">Cargando…</div></div>
+      </div>
+      <div class="tab-panel" id="tabTokens">
+        <div id="tokensContent"><div style="text-align:center;padding:30px;color:var(--muted)">Cargando…</div></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal('modalEstructura')">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     MODAL: DESCARGAR
+═══════════════════════════════════════════════════════════ -->
+<div class="modal-backdrop" id="modalDescarga">
+  <div class="modal" style="max-width:400px">
+    <div class="modal-header">
+      <div class="modal-title">⬇️ Descargar base de datos</div>
+      <button class="modal-close" onclick="closeModal('modalDescarga')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="descargaDbInfo" style="font-size:13px;color:var(--muted);margin-bottom:16px">—</div>
+      <div class="form-group">
+        <label>Contraseña de acceso</label>
+        <input type="password" id="descPassword" placeholder="Contraseña configurada para esta DB"/>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal('modalDescarga')">Cancelar</button>
+      <button class="btn btn-cyan btn-sm" onclick="confirmarDescarga()">⬇️ Descargar</button>
     </div>
   </div>
 </div>
 
 <script>
-function generarToken() {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let t = 'tk_';
-  for(let i=0;i<32;i++) t += chars[Math.floor(Math.random()*chars.length)];
-  document.getElementById('tokenValor').value = t;
+// ──────────────────── ESTADO GLOBAL ────────────────────
+let allDbs = [];
+let currentDb = null;
+let currentFilter = 'all';
+
+// ──────────────────── TOAST ────────────────────
+function toast(msg, tipo='info') {
+  const c = document.getElementById('toastContainer');
+  const t = document.createElement('div');
+  t.className = `toast toast-${tipo}`;
+  t.innerHTML = `<span>${{ok:'✅',err:'❌',info:'ℹ️'}[tipo]||'ℹ️'}</span><span>${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(()=>{ t.style.opacity='0'; t.style.transform='translateX(20px)'; t.style.transition='all .3s'; setTimeout(()=>t.remove(),300); }, 3500);
 }
 
-async function registrarToken() {
-  const payload = {
-    nombre:       document.getElementById('tokenNombre').value.trim(),
-    token:        document.getElementById('tokenValor').value.trim(),
-    plan:         document.getElementById('tokenPlan').value,
-    limite_diario: parseInt(document.getElementById('tokenLimite').value) || 1000,
-    activo:       true
-  };
-  if (!payload.nombre || !payload.token) return alert('Nombre y token son requeridos');
-
-  const res  = await fetch('/api/tabla/metadata_tokens', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  const el   = document.getElementById('tokenResult');
-  el.textContent = JSON.stringify(data, null, 2);
-  el.style.color = res.ok ? 'var(--ok)' : 'var(--err)';
-  el.classList.add('show');
-  if (res.ok) listarTokens();
+// ──────────────────── MODALES ────────────────────
+function openModal(id){ document.getElementById(id).classList.add('show'); }
+function closeModal(id){
+  document.getElementById(id).classList.remove('show');
+  // reset token modal
+  if(id==='modalToken'){
+    document.getElementById('tokenGenerado').style.display='none';
+    document.getElementById('btnGenerar').style.display='';
+    document.getElementById('tkNombre').value='';
+    document.getElementById('tkPassword').value='';
+  }
 }
 
-async function listarTokens() {
-  const res  = await fetch('/api/tabla/metadata_tokens?select=*');
-  const data = await res.json();
-  const cont = document.getElementById('tokensContainer');
+function switchTab(el, panelId) {
+  el.closest('.modal-tabs').querySelectorAll('.modal-tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  el.closest('.modal-body').querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById(panelId).classList.add('active');
+}
 
-  if (!Array.isArray(data) || data.length === 0) {
-    cont.innerHTML = '<p class="empty">No hay tokens registrados aún</p>';
+// ──────────────────── CARGAR CATÁLOGO ────────────────────
+async function cargarCatalogo() {
+  const r = await fetch('/api/dbs');
+  allDbs = await r.json();
+  renderGrid(allDbs);
+}
+
+function filtrar(btn, filtro) {
+  document.querySelectorAll('.filter-tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  currentFilter = filtro;
+  const filtered = filtro === 'all' ? allDbs
+    : filtro === 'activo' ? allDbs.filter(d=>d.configurado)
+    : allDbs.filter(d=>!d.configurado);
+  renderGrid(filtered);
+}
+
+function renderGrid(dbs) {
+  const grid = document.getElementById('dbGrid');
+  if (!dbs.length) {
+    grid.innerHTML = `<div class="empty-state">
+      <div class="empty-icon">🦆</div>
+      <p>No hay bases de datos aún.<br/>Sube un archivo .duckdb para comenzar.</p>
+    </div>`;
     return;
   }
-
-  let html = '<table><thead><tr><th>Nombre</th><th>Token</th><th>Plan</th><th>Límite</th><th>Estado</th></tr></thead><tbody>';
-  data.forEach(t => {
-    html += `<tr>
-      <td>${t.nombre || '—'}</td>
-      <td class="mono">${(t.token||'').substring(0,20)}…</td>
-      <td>${t.plan || '—'}</td>
-      <td>${t.limite_diario || '—'}</td>
-      <td>${t.activo ? '<span class="badge badge-ok">Activo</span>' : '<span class="badge badge-warn">Inactivo</span>'}</td>
-    </tr>`;
-  });
-  html += '</tbody></table>';
-  cont.innerHTML = html;
+  grid.innerHTML = dbs.map(db => cardHTML(db)).join('');
 }
+
+function cardHTML(db) {
+  const nombre = (db.nombre_db || '').replace('.duckdb','').toUpperCase();
+  const cfg = db.configurado;
+  const img = db.imagen_url || '';
+  const conex = db.conexiones || 0;
+  const tamano = db.tamano_mb ? `${db.tamano_mb} MB` : '—';
+
+  const heroContent = img
+    ? `<img src="${img}" alt="${nombre}" onerror="this.style.display='none'"/>`
+    : `<div style="position:absolute;inset:0;background:linear-gradient(135deg,#1a0533,#0a1628,#180a2e)"></div>`;
+
+  const pendingOverlay = !cfg ? `
+    <div class="card-pending-overlay">
+      <div class="clock-icon">⏱️</div>
+      <div class="pending-label">Sin configurar</div>
+      <div class="pending-sub">Esta DB no está lista aún.<br/>Configúrala para activarla.</div>
+    </div>` : '';
+
+  return `<div class="db-card" data-id="${db.id}" data-cfg="${cfg}">
+    <div class="card-hero">
+      ${heroContent}
+      <div class="card-hero-gradient"></div>
+      <div class="card-connections">CONEXIONES: ${conex}</div>
+      <div class="card-badge">DUCKDB</div>
+      <div class="card-hero-title">${nombre}</div>
+      ${pendingOverlay}
+    </div>
+    <div class="card-body">
+      <div class="card-meta">
+        <span class="card-size">${tamano} · ${db.categoria || 'sin categoría'}</span>
+        <div class="card-status-dot ${cfg ? '' : 'pending'}"></div>
+      </div>
+      <div class="card-actions">
+        <button class="action-btn primary" onclick='abrirConfig(${JSON.stringify(db)})' title="Configurar">
+          <span>🗄️</span>
+          <span class="action-tip">Configurar DB</span>
+        </button>
+        <button class="action-btn ${!cfg ? 'disabled' : ''}" ${!cfg ? 'disabled' : ''} onclick='abrirToken(${JSON.stringify(db)})'>
+          <span>🔑</span>
+          <span class="action-tip">Generar Token</span>
+        </button>
+        <button class="action-btn ${!cfg ? 'disabled' : ''}" ${!cfg ? 'disabled' : ''} onclick='abrirEstructura(${JSON.stringify(db)})'>
+          <span>🔗</span>
+          <span class="action-tip">Ver Estructura</span>
+        </button>
+        <button class="action-btn ${!cfg ? 'disabled' : ''}" ${!cfg ? 'disabled' : ''} onclick='abrirDescarga(${JSON.stringify(db)})'>
+          <span>⬇️</span>
+          <span class="action-tip">Descargar</span>
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ──────────────────── ACCIÓN: CONFIGURAR ────────────────────
+function abrirConfig(db) {
+  currentDb = db;
+  document.getElementById('configDbName').textContent = db.nombre_db;
+  document.getElementById('cfgPassword').value = '';
+  document.getElementById('cfgCategoria').value = db.categoria || '';
+  document.getElementById('cfgImagen').value = db.imagen_url || '';
+  document.getElementById('cfgDescripcion').value = db.descripcion || '';
+  openModal('modalConfig');
+}
+
+async function guardarConfig() {
+  const pass = document.getElementById('cfgPassword').value.trim();
+  if (!pass) { toast('La contraseña es obligatoria', 'err'); return; }
+  const payload = {
+    password_descarga: pass,
+    categoria: document.getElementById('cfgCategoria').value.trim(),
+    imagen_url: document.getElementById('cfgImagen').value.trim(),
+    descripcion: document.getElementById('cfgDescripcion').value.trim(),
+    configurado: true,
+  };
+  const r = await fetch(`/api/dbs/${currentDb.id}/configurar`, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+  });
+  if (r.ok) {
+    toast('Base de datos configurada ✅', 'ok');
+    closeModal('modalConfig');
+    cargarCatalogo();
+  } else {
+    toast('Error al guardar', 'err');
+  }
+}
+
+// ──────────────────── ACCIÓN: GENERAR TOKEN ────────────────────
+function abrirToken(db) {
+  currentDb = db;
+  document.getElementById('tokenDbName').textContent = db.nombre_db;
+  openModal('modalToken');
+}
+
+async function generarToken() {
+  const nombre = document.getElementById('tkNombre').value.trim();
+  const pass   = document.getElementById('tkPassword').value.trim();
+  const plan   = document.getElementById('tkPlan').value;
+  if (!nombre || !pass) { toast('Nombre y contraseña requeridos', 'err'); return; }
+
+  const r = await fetch('/api/tokens/generar', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ db_id: currentDb.id, nombre, password: pass, plan })
+  });
+  const data = await r.json();
+  if (r.ok && data.token) {
+    document.getElementById('tokenValor').innerHTML = `<span class="token-copy-label">clic para copiar</span>${data.token}`;
+    document.getElementById('tokenGenerado').style.display = 'block';
+    document.getElementById('btnGenerar').style.display = 'none';
+    toast('Token generado', 'ok');
+  } else {
+    toast(data.error || 'Error al generar token', 'err');
+  }
+}
+
+function copiarToken() {
+  const tv = document.getElementById('tokenValor');
+  const text = tv.innerText.replace('clic para copiar','').trim();
+  navigator.clipboard.writeText(text).then(()=>toast('Token copiado al portapapeles','ok'));
+}
+
+// ──────────────────── ACCIÓN: ESTRUCTURA ────────────────────
+async function abrirEstructura(db) {
+  currentDb = db;
+  document.getElementById('estructuraDbName').textContent = db.nombre_db;
+  document.getElementById('estructuraContent').innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">Cargando…</div>';
+  document.getElementById('tokensContent').innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">Cargando…</div>';
+  openModal('modalEstructura');
+
+  // Info de la DB
+  document.getElementById('estructuraContent').innerHTML = `
+    <table class="struct-table">
+      <thead><tr><th>Campo</th><th>Valor</th></tr></thead>
+      <tbody>
+        <tr><td>Nombre</td><td style="font-family:var(--mono)">${db.nombre_db}</td></tr>
+        <tr><td>Categoría</td><td>${db.categoria || '—'}</td></tr>
+        <tr><td>Tamaño</td><td>${db.tamano_mb ? db.tamano_mb + ' MB' : '—'}</td></tr>
+        <tr><td>Conexiones activas</td><td>${db.conexiones || 0}</td></tr>
+        <tr><td>Descripción</td><td>${db.descripcion || '—'}</td></tr>
+        <tr><td>Configurado</td><td>${db.configurado ? '✅ Sí' : '⏱️ Pendiente'}</td></tr>
+        <tr><td>Registrado</td><td style="font-family:var(--mono);font-size:11px">${db.creado_en ? new Date(db.creado_en).toLocaleString('es') : '—'}</td></tr>
+      </tbody>
+    </table>`;
+
+  // Tokens de esta DB
+  const r2 = await fetch(`/api/dbs/${db.id}/tokens`);
+  const tokens = await r2.json();
+  if (!tokens.length) {
+    document.getElementById('tokensContent').innerHTML = '<p style="color:var(--muted);font-size:13px;padding:20px 0">No hay tokens para esta base de datos</p>';
+  } else {
+    document.getElementById('tokensContent').innerHTML = `
+      <table class="struct-table">
+        <thead><tr><th>Nombre</th><th>Plan</th><th>Estado</th><th>Creado</th></tr></thead>
+        <tbody>${tokens.map(t=>`
+          <tr>
+            <td>${t.nombre}</td>
+            <td><span class="type-pill">${t.plan}</span></td>
+            <td>${t.activo ? '🟢 Activo' : '🔴 Inactivo'}</td>
+            <td style="font-family:var(--mono);font-size:10px">${t.creado_en ? new Date(t.creado_en).toLocaleString('es') : '—'}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+  }
+}
+
+// ──────────────────── ACCIÓN: DESCARGAR ────────────────────
+function abrirDescarga(db) {
+  currentDb = db;
+  document.getElementById('descargaDbInfo').textContent = `Archivo: ${db.nombre_db}`;
+  document.getElementById('descPassword').value = '';
+  openModal('modalDescarga');
+}
+
+async function confirmarDescarga() {
+  const pass = document.getElementById('descPassword').value.trim();
+  if (!pass) { toast('Ingresa la contraseña', 'err'); return; }
+  const r = await fetch(`/api/dbs/${currentDb.id}/descargar`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})
+  });
+  if (r.ok) {
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = currentDb.nombre_db;
+    a.click();
+    toast('Descarga iniciada', 'ok');
+    closeModal('modalDescarga');
+  } else {
+    const data = await r.json();
+    toast(data.error || 'Contraseña incorrecta', 'err');
+  }
+}
+
+// ──────────────────── UPLOAD ────────────────────
+const uploadBox = document.getElementById('uploadBox');
+uploadBox.addEventListener('dragover', e=>{ e.preventDefault(); uploadBox.classList.add('drag'); });
+uploadBox.addEventListener('dragleave', ()=>uploadBox.classList.remove('drag'));
+uploadBox.addEventListener('drop', e=>{
+  e.preventDefault(); uploadBox.classList.remove('drag');
+  const file = e.dataTransfer.files[0];
+  if (file) subirArchivo(file);
+});
+
+function handleFileSelect(input) {
+  const file = input.files[0];
+  if (file) subirArchivo(file);
+}
+
+async function subirArchivo(file) {
+  if (!file.name.endsWith('.duckdb')) { toast('Solo se aceptan archivos .duckdb', 'err'); return; }
+  const prog = document.getElementById('uploadProgress');
+  const bar  = document.getElementById('uploadBar');
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  // Simular progreso mientras sube
+  let fake = 0;
+  const interval = setInterval(()=>{ fake = Math.min(fake + Math.random()*8, 85); bar.style.width=fake+'%'; }, 200);
+
+  const r = await fetch('/api/dbs/upload', { method:'POST', body:formData });
+  clearInterval(interval);
+  bar.style.width = '100%';
+
+  setTimeout(()=>{ prog.style.display='none'; bar.style.width='0%'; }, 800);
+  document.getElementById('fileInput').value = '';
+
+  if (r.ok) {
+    toast(`${file.name} subido — configúrala para activarla`, 'ok');
+    cargarCatalogo();
+  } else {
+    const data = await r.json();
+    toast(data.error || 'Error al subir archivo', 'err');
+  }
+}
+
+// ──────────────────── INIT ────────────────────
+cargarCatalogo();
+setInterval(cargarCatalogo, 30000); // refresh cada 30s
 </script>
 </body>
 </html>
 """
 
-# ──────────────────────────────────────────────────────────────
-# HTML: GESTIÓN DE DATABASES DUCKDB
-# ──────────────────────────────────────────────────────────────
-HTML_DATABASES = """<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────
+# HTML: ADMIN TOKENS
+# ─────────────────────────────────────────────────────────────
+HTML_TOKENS = r"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>Orchestrator — Databases</title>
+<title>Tokens — Orchestrator</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
-  :root{--bg:#0a0e1a;--surface:#111827;--border:#1e2d45;--accent:#3b82f6;--accent2:#06b6d4;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--text:#e2e8f0;--muted:#64748b;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
-  .topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:100;}
-  .topbar-brand{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--accent);letter-spacing:.08em;}
-  .topbar-brand span{color:var(--muted);}
-  .topbar-nav a{color:var(--muted);text-decoration:none;font-size:13px;margin-left:24px;}
-  .topbar-nav a:hover{color:var(--text);}
-  .topbar-nav a.active{color:var(--accent);}
-  .container{max-width:1100px;margin:0 auto;padding:40px 24px;}
-  h1{font-size:26px;font-weight:700;margin-bottom:6px;}
-  .subtitle{color:var(--muted);font-size:14px;margin-bottom:40px;}
-  .section-title{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border);}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:20px;}
-  .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-  .form-group{display:flex;flex-direction:column;gap:6px;}
-  label{font-size:12px;color:var(--muted);letter-spacing:.04em;}
-  input{background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px 12px;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s;}
-  input:focus{border-color:var(--accent);}
-  .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .2s;}
-  .btn:hover{opacity:.85;}
-  .btn-primary{background:var(--accent);color:#fff;}
-  .btn-cyan{background:var(--accent2);color:#000;}
-  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border);}
-  .actions{display:flex;gap:10px;margin-top:14px;}
-  .result-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ok);margin-top:14px;white-space:pre-wrap;display:none;}
-  .result-box.show{display:block;}
-  .db-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;}
-  .db-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:18px;}
-  .db-name{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:var(--accent2);margin-bottom:6px;}
-  .db-meta{font-size:12px;color:var(--muted);line-height:1.6;}
-  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
-  .badge-ok{background:rgba(16,185,129,.15);color:var(--ok);}
-  .empty{color:var(--muted);font-size:14px;padding:30px 0;text-align:center;}
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+:root{--bg:#07080f;--surface:#0d1117;--card:#111827;--border:#1a2332;--accent:#7c3aed;--accent2:#06b6d4;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--text:#f1f5f9;--muted:#4b5563;--mono:'JetBrains Mono',monospace;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:200;}
+.brand{font-family:var(--mono);font-size:12px;color:var(--accent2);letter-spacing:.12em;}
+.brand b{color:var(--text);}
+.nav a{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;text-decoration:none;color:var(--muted);margin-left:4px;transition:all .2s;}
+.nav a:hover{color:var(--text);background:rgba(255,255,255,.05);}
+.nav a.active{color:var(--accent2);background:rgba(6,182,212,.08);}
+.container{max-width:1100px;margin:0 auto;padding:36px 24px;}
+h1{font-size:22px;font-weight:700;margin-bottom:4px;}
+.subtitle{color:var(--muted);font-size:13px;margin-bottom:32px;}
+.section-title{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+table{width:100%;border-collapse:collapse;}
+th{text-align:left;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);}
+td{padding:11px 14px;border-bottom:1px solid rgba(26,35,50,.6);font-size:13px;vertical-align:middle;}
+tr:hover td{background:rgba(124,58,237,.04);}
+.mono{font-family:var(--mono);font-size:11px;color:var(--muted);}
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;}
+.badge-ok{background:rgba(16,185,129,.12);color:var(--ok);}
+.badge-warn{background:rgba(245,158,11,.12);color:var(--warn);}
+.badge-plan{background:rgba(124,58,237,.12);color:var(--accent);}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--border);}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.2);}
+.btn:hover{filter:brightness(1.15);}
+.empty{color:var(--muted);font-size:13px;padding:40px;text-align:center;}
+#toastContainer{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;}
+.toast{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:500;border:1px solid;min-width:220px;animation:slideIn .25s ease;}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px);}to{opacity:1;transform:translateX(0);}}
+.toast-ok{background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.3);color:var(--ok);}
+.toast-err{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.3);color:var(--err);}
 </style>
 </head>
 <body>
 <div class="topbar">
-  <div class="topbar-brand">ORCHESTRATOR <span>CORE API</span> — v3.5.0</div>
-  <nav class="topbar-nav">
-    <a href="/">Dashboard</a>
-    <a href="/tablas">Tablas</a>
-    <a href="/tokens">Tokens</a>
-    <a href="/databases" class="active">Databases</a>
+  <div class="brand"><b>DUCKDB</b> CATALOG — <span>ORCHESTRATOR v4.0</span></div>
+  <nav class="nav">
+    <a href="/">Catálogo</a>
+    <a href="/admin/tokens" class="active">Tokens</a>
+    <a href="/admin/setup">Setup</a>
     <a href="/docs">API Docs</a>
   </nav>
 </div>
-
 <div class="container">
-  <h1>Bases de Datos DuckDB</h1>
-  <p class="subtitle">Registra y activa archivos .duckdb en el catálogo del sistema</p>
+  <h1>Tokens de Acceso</h1>
+  <p class="subtitle">Todos los tokens generados por base de datos</p>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <span class="section-title" style="margin:0;padding:0;border:none">Tokens registrados</span>
+    <button class="btn btn-ghost" onclick="cargar()">⟳ Actualizar</button>
+  </div>
+  <div id="tablaContainer"><p class="empty">Cargando…</p></div>
+</div>
+<div id="toastContainer"></div>
+<script>
+function toast(msg,tipo='ok'){
+  const c=document.getElementById('toastContainer');
+  const t=document.createElement('div');
+  t.className=`toast toast-${tipo}`;
+  t.innerHTML=`<span>${tipo==='ok'?'✅':'❌'}</span><span>${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);},3000);
+}
+async function cargar(){
+  const r=await fetch('/api/tokens');
+  const data=await r.json();
+  const cont=document.getElementById('tablaContainer');
+  if(!data.length){cont.innerHTML='<p class="empty">Sin tokens registrados</p>';return;}
+  cont.innerHTML=`<table>
+    <thead><tr><th>Nombre</th><th>Base de Datos</th><th>Plan</th><th>Estado</th><th>Creado</th><th></th></tr></thead>
+    <tbody>${data.map(t=>`<tr>
+      <td>${t.nombre}</td>
+      <td class="mono">${t.db_nombre||'—'}</td>
+      <td><span class="badge badge-plan">${t.plan}</span></td>
+      <td>${t.activo?'<span class="badge badge-ok">Activo</span>':'<span class="badge badge-warn">Inactivo</span>'}</td>
+      <td class="mono">${t.creado_en?new Date(t.creado_en).toLocaleString('es'):'—'}</td>
+      <td><button class="btn btn-danger" onclick="revocar(${t.id})">Revocar</button></td>
+    </tr>`).join('')}</tbody></table>`;
+}
+async function revocar(id){
+  if(!confirm('¿Revocar este token?'))return;
+  const r=await fetch(`/api/tokens/${id}/revocar`,{method:'PATCH'});
+  if(r.ok){toast('Token revocado');cargar();}else toast('Error','err');
+}
+cargar();
+</script>
+</body>
+</html>
+"""
 
-  <p class="section-title">Configurar Nueva Base de Datos</p>
+# ─────────────────────────────────────────────────────────────
+# HTML: SETUP — INICIALIZAR TABLAS
+# ─────────────────────────────────────────────────────────────
+HTML_SETUP = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<title>Setup — Orchestrator</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+:root{--bg:#07080f;--surface:#0d1117;--card:#111827;--border:#1a2332;--accent:#7c3aed;--accent2:#06b6d4;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--text:#f1f5f9;--muted:#4b5563;--mono:'JetBrains Mono',monospace;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;background:var(--surface);border-bottom:1px solid var(--border);}
+.brand{font-family:var(--mono);font-size:12px;color:var(--accent2);letter-spacing:.12em;}
+.brand b{color:var(--text);}
+.nav a{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;text-decoration:none;color:var(--muted);margin-left:4px;}
+.nav a:hover{color:var(--text);}
+.nav a.active{color:var(--accent2);}
+.container{max-width:700px;margin:0 auto;padding:48px 24px;}
+h1{font-size:22px;font-weight:700;margin-bottom:6px;}
+.subtitle{color:var(--muted);font-size:13px;margin-bottom:32px;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:16px;}
+.card-title{font-size:14px;font-weight:700;margin-bottom:6px;}
+.card-desc{font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.6;}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s;}
+.btn-primary{background:var(--accent);color:#fff;}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--border);}
+.btn:hover{filter:brightness(1.1);}
+.result{margin-top:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:var(--mono);font-size:12px;line-height:1.7;white-space:pre-wrap;display:none;max-height:200px;overflow-y:auto;}
+.result.show{display:block;}
+.ok-line{color:var(--ok);}
+.err-line{color:var(--err);}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><b>DUCKDB</b> CATALOG — <span>ORCHESTRATOR v4.0</span></div>
+  <nav class="nav">
+    <a href="/">Catálogo</a>
+    <a href="/admin/tokens">Tokens</a>
+    <a href="/admin/setup" class="active">Setup</a>
+    <a href="/docs">API Docs</a>
+  </nav>
+</div>
+<div class="container">
+  <h1>Setup del Sistema</h1>
+  <p class="subtitle">Inicializa las tablas en Supabase y verifica la conectividad</p>
+
   <div class="card">
-    <div class="form-row">
-      <div class="form-group">
-        <label>NOMBRE DEL ARCHIVO (.duckdb)</label>
-        <input id="dbNombre" placeholder="datos_reniec_2024.duckdb"/>
-      </div>
-      <div class="form-group">
-        <label>CONTRASEÑA DE DESCARGA</label>
-        <input id="dbPassword" type="password" placeholder="pass_seguro_para_bots"/>
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="form-group">
-        <label>CATEGORÍA</label>
-        <input id="dbCategoria" placeholder="reniec, sunat, padron"/>
-      </div>
-      <div class="form-group">
-        <label>URL DE IMAGEN (tarjeta visual)</label>
-        <input id="dbImagen" placeholder="https://ejemplo.com/imagen.jpg"/>
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="configurarDB()">+ Registrar base de datos</button>
-    </div>
-    <div class="result-box" id="dbResult"></div>
+    <div class="card-title">1. Crear tablas base en Supabase</div>
+    <div class="card-desc">Crea las tablas <code>catalog_dbs</code> y <code>catalog_tokens</code> en el esquema público. Si ya existen no hace nada (IF NOT EXISTS).</div>
+    <button class="btn btn-primary" onclick="crearTablas()">▶ Ejecutar migración</button>
+    <div class="result" id="rTablas"></div>
   </div>
 
-  <p class="section-title">Catálogo de Bases de Datos</p>
   <div class="card">
-    <div class="actions" style="margin-top:0;margin-bottom:14px">
-      <button class="btn btn-ghost" onclick="listarDbs()">⟳ Actualizar catálogo</button>
-    </div>
-    <div id="dbsContainer">
-      <p class="empty">Haz clic en "Actualizar catálogo" para ver las bases de datos registradas</p>
-    </div>
+    <div class="card-title">2. Verificar conectividad</div>
+    <div class="card-desc">Chequea que Supabase responde correctamente y las tablas son accesibles.</div>
+    <button class="btn btn-ghost" onclick="verificar()">⟳ Verificar</button>
+    <div class="result" id="rVerify"></div>
   </div>
 </div>
-
 <script>
-async function configurarDB() {
-  const nombre   = document.getElementById('dbNombre').value.trim();
-  const password = document.getElementById('dbPassword').value.trim();
-  const categoria= document.getElementById('dbCategoria').value.trim();
-  const imagen   = document.getElementById('dbImagen').value.trim();
-  if (!nombre || !password) return alert('Nombre y contraseña son requeridos');
-
-  const form = new URLSearchParams();
-  form.append('nombre_db', nombre);
-  form.append('password_descarga', password);
-  form.append('categoria', categoria);
-  form.append('imagen_url', imagen);
-
-  const res  = await fetch('/api/database/configure', {method:'POST', body: form});
-  const data = await res.json();
-  const el   = document.getElementById('dbResult');
-  el.textContent = JSON.stringify(data, null, 2);
-  el.style.color = res.ok ? 'var(--ok)' : 'var(--err)';
+function mostrar(id, lineas){
+  const el=document.getElementById(id);
+  el.innerHTML=lineas.map(l=>`<span class="${l.ok?'ok-line':'err-line'}">${l.ok?'✅':'❌'} ${l.msg}</span>\n`).join('');
   el.classList.add('show');
-  if (res.ok) listarDbs();
 }
-
-async function listarDbs() {
-  const res  = await fetch('/api/tabla/metadata_dbs?select=*');
-  const data = await res.json();
-  const cont = document.getElementById('dbsContainer');
-
-  if (!Array.isArray(data) || data.length === 0) {
-    cont.innerHTML = '<p class="empty">No hay bases de datos registradas aún</p>';
-    return;
-  }
-
-  let html = '<div class="db-grid">';
-  data.forEach(db => {
-    html += `<div class="db-card">
-      <div class="db-name">${db.nombre_db || db.nombre || '—'}</div>
-      <div class="db-meta">
-        Categoría: ${db.categoria || '—'}<br/>
-        ${db.activo ? '<span class="badge badge-ok">Activo</span>' : ''}
-      </div>
-    </div>`;
-  });
-  html += '</div>';
-  cont.innerHTML = html;
+async function crearTablas(){
+  const r=await fetch('/api/setup/init',{method:'POST'});
+  const data=await r.json();
+  mostrar('rTablas',data.resultados);
+}
+async function verificar(){
+  const r=await fetch('/api/check');
+  const data=await r.json();
+  mostrar('rVerify',data.checks.map(c=>({ok:c.ok,msg:`${c.nombre}: ${c.detalle}`})));
 }
 </script>
 </body>
@@ -807,212 +1022,192 @@ async function listarDbs() {
 """
 
 
-# ──────────────────────────────────────────────────────────────
-# RUTAS DE VISTAS (HTML Pages)
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# RUTAS HTML
+# ═══════════════════════════════════════════════════════════
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    return HTML_DASHBOARD
+async def index(): return HTML_INDEX
 
-@app.get("/tablas", response_class=HTMLResponse)
-async def tablas_page():
-    return HTML_TABLAS
+@app.get("/admin/tokens", response_class=HTMLResponse)
+async def admin_tokens(): return HTML_TOKENS
 
-@app.get("/tokens", response_class=HTMLResponse)
-async def tokens_page():
-    return HTML_TOKENS
-
-@app.get("/databases", response_class=HTMLResponse)
-async def databases_page():
-    return HTML_DATABASES
+@app.get("/admin/setup", response_class=HTMLResponse)
+async def admin_setup(): return HTML_SETUP
 
 
-# ──────────────────────────────────────────────────────────────
-# API: CHEQUEO DEL SISTEMA
-# ──────────────────────────────────────────────────────────────
-@app.get("/api/check")
-async def check_sistema():
-    checks = []
+# ═══════════════════════════════════════════════════════════
+# API: BASES DE DATOS
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/dbs")
+async def listar_dbs():
+    dbs = sb_get("catalog_dbs", "?select=*&order=creado_en.desc")
+    if not isinstance(dbs, list):
+        dbs = []
+    # Enriquecer con conteo de tokens
+    for db in dbs:
+        tokens = sb_get("catalog_tokens", f"?select=id&db_id=eq.{db['id']}&activo=eq.true")
+        db["conexiones"] = len(tokens) if isinstance(tokens, list) else 0
+        # Tamaño real del archivo si existe
+        path = os.path.join(STORAGE_DIR, db.get("nombre_db",""))
+        if os.path.exists(path):
+            db["tamano_mb"] = round(os.path.getsize(path) / 1024 / 1024, 2)
+    return dbs
 
-    def ping(nombre, url, endpoint_label=None):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=6)
-            ok = r.status_code in (200, 206)
-            checks.append({
-                "nombre":   nombre,
-                "endpoint": endpoint_label or url,
-                "ok":       ok,
-                "detalle":  f"HTTP {r.status_code}",
-            })
-        except Exception as e:
-            checks.append({
-                "nombre":   nombre,
-                "endpoint": endpoint_label or url,
-                "ok":       False,
-                "detalle":  str(e)[:80],
-            })
+@app.post("/api/dbs/upload")
+async def upload_db(file: UploadFile = File(...)):
+    if not file.filename.endswith(".duckdb"):
+        raise HTTPException(400, "Solo archivos .duckdb")
+    dest = os.path.join(STORAGE_DIR, file.filename)
+    content = await file.read()
+    with open(dest, "wb") as f:
+        f.write(content)
+    # Registrar en Supabase si no existe
+    existing = sb_get("catalog_dbs", f"?nombre_db=eq.{file.filename}")
+    if not isinstance(existing, list) or len(existing) == 0:
+        status, data = sb_post("catalog_dbs", {
+            "nombre_db": file.filename,
+            "configurado": False,
+            "conexiones": 0,
+        })
+        if status not in (200,201):
+            return JSONResponse({"error": "Archivo guardado pero no pudo registrarse en Supabase", "detail": str(data)}, status_code=500)
+    return {"ok": True, "nombre": file.filename, "bytes": len(content)}
 
-    ping("Supabase REST",    f"{SUPABASE_URL}/rest/v1/",               "/rest/v1/")
-    ping("DuckDB API",       f"{DUCKDB_API_URL}/health",               "/health")
-    ping("metadata_dbs",     f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=id&limit=1", "metadata_dbs")
-    ping("metadata_tokens",  f"{SUPABASE_URL}/rest/v1/metadata_tokens?select=id&limit=1", "metadata_tokens")
-
-    return {"checks": checks}
-
-
-# ──────────────────────────────────────────────────────────────
-# API: EJECUTAR SQL REMOTO (vía RPC)
-# ──────────────────────────────────────────────────────────────
-@app.post("/api/sql")
-async def ejecutar_sql(request: Request):
-    body = await request.json()
-    query = body.get("query", "").strip()
-    if not query:
-        raise HTTPException(400, "query vacía")
-
-    # Intento 1: endpoint /rest/v1/sql (Supabase ≥ 2.x)
-    r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/sql",
-        headers=HEADERS,
-        json={"query": query},
-        timeout=10,
-    )
-
-    if r.status_code == 404:
-        # Intento 2: RPC función ejecutar_sql_remoto
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/ejecutar_sql_remoto",
-            headers=HEADERS,
-            json={"query": query},
-            timeout=10,
-        )
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-
-    return JSONResponse(content={"status": r.status_code, "data": data}, status_code=200)
-
-
-# ──────────────────────────────────────────────────────────────
-# API: CRUD GENÉRICO SOBRE CUALQUIER TABLA
-# ──────────────────────────────────────────────────────────────
-@app.get("/api/tabla/{tabla}")
-async def leer_tabla(tabla: str, request: Request):
-    qs  = str(request.url.query)
-    url = f"{SUPABASE_URL}/rest/v1/{tabla}{'?' + qs if qs else '?select=*'}"
-    r   = requests.get(url, headers=HEADERS, timeout=10)
-    try:
-        return JSONResponse(content=r.json(), status_code=r.status_code)
-    except Exception:
-        return JSONResponse(content={"raw": r.text}, status_code=r.status_code)
-
-
-@app.post("/api/tabla/{tabla}")
-async def insertar_en_tabla(tabla: str, request: Request):
+@app.patch("/api/dbs/{db_id}/configurar")
+async def configurar_db(db_id: int, request: Request):
     payload = await request.json()
-    hdrs    = {**HEADERS, "Prefer": "return=representation"}
-    r       = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{tabla}",
-        headers=hdrs,
-        json=payload,
-        timeout=10,
-    )
-    try:
-        return JSONResponse(content=r.json(), status_code=r.status_code)
-    except Exception:
-        return JSONResponse(content={"raw": r.text}, status_code=r.status_code)
+    status, data = sb_patch("catalog_dbs", f"?id=eq.{db_id}", payload)
+    if status in (200,204):
+        return {"ok": True}
+    return JSONResponse({"error": str(data)}, status_code=400)
+
+@app.get("/api/dbs/{db_id}/tokens")
+async def tokens_de_db(db_id: int):
+    t = sb_get("catalog_tokens", f"?db_id=eq.{db_id}&select=*&order=creado_en.desc")
+    return t if isinstance(t, list) else []
+
+@app.post("/api/dbs/{db_id}/descargar")
+async def descargar_db(db_id: int, request: Request):
+    from fastapi.responses import FileResponse
+    body = await request.json()
+    password = body.get("password","")
+    dbs = sb_get("catalog_dbs", f"?id=eq.{db_id}&select=*")
+    if not isinstance(dbs, list) or not dbs:
+        raise HTTPException(404, "DB no encontrada")
+    db = dbs[0]
+    if db.get("password_descarga","") != password:
+        return JSONResponse({"error": "Contraseña incorrecta"}, status_code=403)
+    path = os.path.join(STORAGE_DIR, db["nombre_db"])
+    if not os.path.exists(path):
+        return JSONResponse({"error": "Archivo no encontrado en storage"}, status_code=404)
+    return FileResponse(path, filename=db["nombre_db"], media_type="application/octet-stream")
 
 
-# ──────────────────────────────────────────────────────────────
-# API: CONFIGURAR BASE DE DATOS DUCKDB (Form → Supabase)
-# ──────────────────────────────────────────────────────────────
-@app.post("/api/database/configure")
-async def configurar_database(
-    nombre_db:         str = Form(...),
-    password_descarga: str = Form(...),
-    categoria:         str = Form(""),
-    imagen_url:        str = Form(""),
-):
-    payload = {
-        "nombre_db":         nombre_db,
-        "password_descarga": password_descarga,
-        "categoria":         categoria,
-        "imagen_url":        imagen_url,
-        "activo":            True,
-    }
-    hdrs = {**HEADERS, "Prefer": "return=representation"}
-    r    = requests.post(
-        f"{SUPABASE_URL}/rest/v1/metadata_dbs",
-        headers=hdrs,
-        json=payload,
-        timeout=10,
-    )
-    try:
-        return JSONResponse(content=r.json(), status_code=r.status_code)
-    except Exception:
-        return JSONResponse(content={"raw": r.text}, status_code=r.status_code)
+# ═══════════════════════════════════════════════════════════
+# API: TOKENS
+# ═══════════════════════════════════════════════════════════
+@app.get("/api/tokens")
+async def listar_tokens():
+    tokens = sb_get("catalog_tokens", "?select=*,catalog_dbs(nombre_db)&order=creado_en.desc")
+    if not isinstance(tokens, list):
+        return []
+    for t in tokens:
+        if isinstance(t.get("catalog_dbs"), dict):
+            t["db_nombre"] = t["catalog_dbs"].get("nombre_db","")
+            del t["catalog_dbs"]
+    return tokens
+
+@app.post("/api/tokens/generar")
+async def generar_token(request: Request):
+    body = await request.json()
+    db_id    = body.get("db_id")
+    nombre   = body.get("nombre","").strip()
+    password = body.get("password","").strip()
+    plan     = body.get("plan","basic")
+    if not db_id or not nombre or not password:
+        return JSONResponse({"error": "Faltan campos requeridos"}, status_code=400)
+    # Verificar contraseña
+    dbs = sb_get("catalog_dbs", f"?id=eq.{db_id}&select=password_descarga")
+    if not isinstance(dbs, list) or not dbs:
+        return JSONResponse({"error": "DB no encontrada"}, status_code=404)
+    if dbs[0].get("password_descarga","") != password:
+        return JSONResponse({"error": "Contraseña incorrecta"}, status_code=403)
+    # Generar token único
+    token_val = "tk_" + secrets.token_hex(24)
+    limites = {"basic": 500, "pro": 5000, "enterprise": 999999}
+    status, data = sb_post("catalog_tokens", {
+        "db_id": db_id,
+        "nombre": nombre,
+        "token": token_val,
+        "plan": plan,
+        "limite_diario": limites.get(plan, 500),
+        "activo": True,
+    })
+    if status in (200,201):
+        return {"ok": True, "token": token_val}
+    return JSONResponse({"error": str(data)}, status_code=500)
+
+@app.patch("/api/tokens/{token_id}/revocar")
+async def revocar_token(token_id: int):
+    status, data = sb_patch("catalog_tokens", f"?id=eq.{token_id}", {"activo": False})
+    return {"ok": status in (200,204)}
 
 
-# ──────────────────────────────────────────────────────────────
-# API: CREAR TABLAS BASE DEL SISTEMA (acción rápida del dashboard)
-# ──────────────────────────────────────────────────────────────
-TABLAS_BASE = {
-    "metadata_dbs": """
-        CREATE TABLE IF NOT EXISTS public.metadata_dbs (
+# ═══════════════════════════════════════════════════════════
+# API: SETUP — MIGRACIÓN DE TABLAS
+# ═══════════════════════════════════════════════════════════
+MIGRACIONES = {
+    "catalog_dbs": """
+        CREATE TABLE IF NOT EXISTS public.catalog_dbs (
             id                BIGSERIAL PRIMARY KEY,
             nombre_db         TEXT NOT NULL,
             password_descarga TEXT,
             categoria         TEXT,
             imagen_url        TEXT,
-            activo            BOOLEAN DEFAULT TRUE,
+            descripcion       TEXT,
+            configurado       BOOLEAN DEFAULT FALSE,
+            conexiones        INTEGER DEFAULT 0,
             creado_en         TIMESTAMPTZ DEFAULT NOW()
         );
     """,
-    "metadata_tokens": """
-        CREATE TABLE IF NOT EXISTS public.metadata_tokens (
+    "catalog_tokens": """
+        CREATE TABLE IF NOT EXISTS public.catalog_tokens (
             id            BIGSERIAL PRIMARY KEY,
+            db_id         BIGINT REFERENCES public.catalog_dbs(id) ON DELETE CASCADE,
             nombre        TEXT NOT NULL,
             token         TEXT UNIQUE NOT NULL,
             plan          TEXT DEFAULT 'basic',
-            limite_diario INTEGER DEFAULT 1000,
+            limite_diario INTEGER DEFAULT 500,
             activo        BOOLEAN DEFAULT TRUE,
             creado_en     TIMESTAMPTZ DEFAULT NOW()
         );
     """,
 }
 
-@app.post("/api/crear-tablas")
-async def crear_tablas_base():
+@app.post("/api/setup/init")
+async def setup_init():
     resultados = []
-    for nombre, sql in TABLAS_BASE.items():
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/sql",
-            headers=HEADERS,
-            json={"query": sql.strip()},
-            timeout=10,
-        )
-        if r.status_code == 404:
-            r = requests.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/ejecutar_sql_remoto",
-                headers=HEADERS,
-                json={"query": sql.strip()},
-                timeout=10,
-            )
-        ok = r.status_code in (200, 201, 204)
-        resultados.append({
-            "tabla":  nombre,
-            "ok":     ok,
-            "status": r.status_code,
-            "msg":    f"Tabla '{nombre}': {'✅ OK' if ok else '❌ ERROR'} (HTTP {r.status_code})",
-        })
+    for nombre, sql in MIGRACIONES.items():
+        status, _ = ejecutar_sql(sql.strip())
+        ok = status in (200,201,204)
+        resultados.append({"tabla": nombre, "ok": ok, "msg": f"Tabla '{nombre}': HTTP {status}", "status": status})
     return {"resultados": resultados}
 
+@app.get("/api/check")
+async def check():
+    checks = []
+    def ping(nombre, url):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=6)
+            checks.append({"nombre": nombre, "endpoint": url, "ok": r.status_code < 400, "detalle": f"HTTP {r.status_code}"})
+        except Exception as e:
+            checks.append({"nombre": nombre, "endpoint": url, "ok": False, "detalle": str(e)[:60]})
+    ping("Supabase REST", f"{SUPABASE_URL}/rest/v1/")
+    ping("catalog_dbs",   f"{SUPABASE_URL}/rest/v1/catalog_dbs?select=id&limit=1")
+    ping("catalog_tokens",f"{SUPABASE_URL}/rest/v1/catalog_tokens?select=id&limit=1")
+    return {"checks": checks}
 
-# ──────────────────────────────────────────────────────────────
-# ARRANQUE LOCAL
-# ──────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
