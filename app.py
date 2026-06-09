@@ -1,6 +1,7 @@
 import os
 import uuid
 import shutil
+from contextlib import asynccontextcontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +26,76 @@ HEADERS_SUPABASE = {
     "Prefer": "return=representation"  # Exige a Supabase que retorne objetos estructurados
 }
 
-app = FastAPI(title="SaaS Orchestrator Core API", version="3.0.0")
+# =====================================================================
+# 🚀 INICIALIZADOR AUTOMÁTICO DE TABLAS (AL LEVANTAR EL CONTENEDOR)
+# =====================================================================
+def inicializar_tablas_supabase():
+    """
+    Se conecta al administrador de Supabase por HTTP y crea la estructura
+    relacional necesaria si no existe en la base de datos PostgreSQL remota.
+    """
+    print("⚡ [STARTUP] Verificando e inicializando tablas en Supabase remota...")
+    
+    # Script SQL maestro para estructurar tu panel SaaS
+    sql_script = """
+    -- 1. Tabla de cartas / bases de datos activas
+    CREATE TABLE IF NOT EXISTS public.metadata_dbs (
+        nombre_db TEXT PRIMARY KEY,
+        password_descarga TEXT,
+        categoria TEXT,
+        imagen TEXT,
+        tabla_principal TEXT,
+        total_registros BIGINT,
+        peso_mb REAL,
+        configurada BOOLEAN DEFAULT true
+    );
+
+    -- 2. Tabla de tokens de acceso individuales asignados por cliente
+    CREATE TABLE IF NOT EXISTS public.metadata_tokens (
+        token TEXT PRIMARY KEY,
+        usuario TEXT,
+        database TEXT
+    );
+
+    -- 3. Tabla de logs e historial de auditoría de conexiones globales
+    CREATE TABLE IF NOT EXISTS public.metadata_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        token TEXT,
+        usuario TEXT,
+        database TEXT,
+        evento TEXT,
+        fecha TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now())
+    );
+    """
+    
+    # Endpoint administrativo de Supabase para ejecutar comandos SQL directos mediante la Service Key
+    url_admin_sql = f"{SUPABASE_URL}/admin/api/query"
+    
+    try:
+        payload = {"query": sql_script}
+        response = requests.post(url_admin_sql, headers=HEADERS_SUPABASE, json=payload, timeout=15)
+        
+        # Si el endpoint /admin no está expuesto directamente por la configuración de red,
+        # arrojamos la advertencia pero dejamos que el sistema continúe si las tablas ya fueron creadas manualmente.
+        if response.status_code in [200, 201]:
+            print("✅ [SUPABASE] Estructura de base de datos sincronizada y verificada con éxito.")
+        else:
+            print(f"⚠️ [SUPABASE] La API respondió con código {response.status_code} al verificar tablas.")
+            print("💡 Si ya ejecutaste el Script SQL en el editor web de Supabase Studio, puedes ignorar esta alerta.")
+            
+    except Exception as e:
+        print(f"❌ [STARTUP_ERROR] No se pudo conectar al inicializador de Supabase: {str(e)}")
+
+
+# Manejador del ciclo de vida moderno de FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Esto corre exactamente cuando el contenedor pasa a estado 'RUNNING'
+    inicializar_tablas_supabase()
+    yield
+    # Aquí puedes poner lógica para cuando el contenedor se apague si lo necesitas
+
+app = FastAPI(title="SaaS Orchestrator Core API", version="3.1.0", lifespan=lifespan)
 
 # 🌍 APERTURA TOTAL DE CORS PARA TU FRONTEND HTML CYBERPUNK
 app.add_middleware(
@@ -43,7 +113,6 @@ app.add_middleware(
 @app.get("/api/stream/{token}/{db_name}")
 async def stream_database_httpfs(token: str, db_name: str):
     """Canal de comunicación asíncrono para tus bots externos. DuckDB httpfs consume este endpoint."""
-    # Consultar si el token existe consumiendo la API HTTP de Supabase (PostgREST)
     url_token = f"{SUPABASE_URL}/rest/v1/metadata_tokens?token=eq.{token}&select=usuario,database"
     try:
         res_token = requests.get(url_token, headers=HEADERS_SUPABASE, timeout=10)
@@ -89,7 +158,6 @@ async def escanear_archivos_nuevos():
     """🔍 ESCÁNER DE ARCHIVOS: Compara el disco contra Supabase y detecta si hay archivos .duckdb nuevos huérfanos."""
     archivos_en_disco = [f for f in os.listdir(DB_DIR) if f.endswith('.duckdb')]
     
-    # Consultar DBs registradas desde la API REST de Supabase
     try:
         res_dbs = requests.get(f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db", headers=HEADERS_SUPABASE, timeout=10)
         lista_registradas = [r["nombre_db"] for r in res_dbs.json()] if res_dbs.status_code == 200 else []
@@ -130,7 +198,6 @@ async def configurar_y_memorizar_db(
     if not os.path.exists(ruta_real):
         raise HTTPException(status_code=404, detail="El archivo binario no se encuentra en la carpeta física del disco")
 
-    # Extraer metadatos estructurales automáticos abriendo el archivo local de forma efímera
     tabla_detectada = "N/A"
     total_filas = 0
     try:
@@ -145,7 +212,6 @@ async def configurar_y_memorizar_db(
 
     peso_mb = round(os.path.getsize(ruta_real) / (1024 * 1024), 2)
 
-    # Payload estructurado para PostgREST (Supabase) con Upsert nativo
     db_payload = {
         "nombre_db": nombre_db,
         "password_descarga": password_descarga,
@@ -157,7 +223,6 @@ async def configurar_y_memorizar_db(
         "configurada": True
     }
     
-    # Hacemos el merge mediante HTTP Headers para resolver duplicados si se re-configura la tarjeta
     headers_upsert = HEADERS_SUPABASE.copy()
     headers_upsert["Resolution"] = "merge-duplicates"
     requests.post(f"{SUPABASE_URL}/rest/v1/metadata_dbs", headers=headers_upsert, json=db_payload, timeout=10)
@@ -270,5 +335,4 @@ async def ver_logs_trafico_red():
 
 if __name__ == "__main__":
     import uvicorn
-    # Correr en el puerto 8000 mapeado en Dokploy
     uvicorn.run(app, host="0.0.0.0", port=8000)
