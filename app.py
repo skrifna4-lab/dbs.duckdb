@@ -1,7 +1,7 @@
 import os
 import uuid
 import shutil
-from contextlib import asynccontextcontextmanager
+from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,9 +36,8 @@ def inicializar_tablas_supabase():
     """
     print("⚡ [STARTUP] Verificando e inicializando tablas en Supabase remota...")
     
-    # Script SQL maestro para estructurar tu panel SaaS
+    # Script SQL maestro para estructurar tu panel SaaS en Postgres
     sql_script = """
-    -- 1. Tabla de cartas / bases de datos activas
     CREATE TABLE IF NOT EXISTS public.metadata_dbs (
         nombre_db TEXT PRIMARY KEY,
         password_descarga TEXT,
@@ -50,14 +49,12 @@ def inicializar_tablas_supabase():
         configurada BOOLEAN DEFAULT true
     );
 
-    -- 2. Tabla de tokens de acceso individuales asignados por cliente
     CREATE TABLE IF NOT EXISTS public.metadata_tokens (
         token TEXT PRIMARY KEY,
         usuario TEXT,
         database TEXT
     );
 
-    -- 3. Tabla de logs e historial de auditoría de conexiones globales
     CREATE TABLE IF NOT EXISTS public.metadata_logs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         token TEXT,
@@ -68,15 +65,13 @@ def inicializar_tablas_supabase():
     );
     """
     
-    # Endpoint administrativo de Supabase para ejecutar comandos SQL directos mediante la Service Key
+    # Endpoint de la API REST de Supabase para ejecutar comandos SQL usando la Service Key
     url_admin_sql = f"{SUPABASE_URL}/admin/api/query"
     
     try:
         payload = {"query": sql_script}
         response = requests.post(url_admin_sql, headers=HEADERS_SUPABASE, json=payload, timeout=15)
         
-        # Si el endpoint /admin no está expuesto directamente por la configuración de red,
-        # arrojamos la advertencia pero dejamos que el sistema continúe si las tablas ya fueron creadas manualmente.
         if response.status_code in [200, 201]:
             print("✅ [SUPABASE] Estructura de base de datos sincronizada y verificada con éxito.")
         else:
@@ -87,13 +82,12 @@ def inicializar_tablas_supabase():
         print(f"❌ [STARTUP_ERROR] No se pudo conectar al inicializador de Supabase: {str(e)}")
 
 
-# Manejador del ciclo de vida moderno de FastAPI
+# Manejador del ciclo de vida de FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Esto corre exactamente cuando el contenedor pasa a estado 'RUNNING'
+    # Corre exactamente cuando el contenedor pasa a estado 'RUNNING'
     inicializar_tablas_supabase()
     yield
-    # Aquí puedes poner lógica para cuando el contenedor se apague si lo necesitas
 
 app = FastAPI(title="SaaS Orchestrator Core API", version="3.1.0", lifespan=lifespan)
 
