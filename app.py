@@ -22,26 +22,27 @@ SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3ODEwMTQzOTk
 HEADERS_SUPABASE = {
     "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
     "apiKey": SERVICE_ROLE_KEY,
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"  # Exige a Supabase que retorne objetos estructurados
+    "Content-Type": "application/json"
 }
 
 # =====================================================================
-# 🚀 INICIALIZADOR AUTOMÁTICO DE TABLAS (AL LEVANTAR EL CONTENEDOR)
+# 🔥 CREACIÓN AUTOMÁTICA DE TABLAS POR API (MÉTODO RPC DE SUPABASE)
 # =====================================================================
-def inicializar_tablas_supabase():
+def inicializar_tablas_desde_la_api():
     """
-    Se conecta al administrador de Supabase por HTTP y crea la estructura
-    relacional necesaria si no existe en la base de datos PostgreSQL remota.
+    Este bloque se ejecuta de forma obligatoria en el arranque del contenedor.
+    Envía el script DDL de creación de tablas al endpoint RPC remoto.
     """
-    print("⚡ [STARTUP] Verificando e inicializando tablas en Supabase remota...")
+    print("⚡ [STARTUP] Conectando a la API REST de Supabase para asegurar la creación de las tablas...")
+    url_rpc = f"{SUPABASE_URL}/rest/v1/rpc/ejecutar_sql_remoto"
     
-    # Script SQL maestro para estructurar tu panel SaaS en Postgres
+    # Sentencias SQL estructuradas de forma limpia sin errores de sintaxis
     sql_script = """
+    -- 1. Tabla de control de cartas (Bases de datos estáticas)
     CREATE TABLE IF NOT EXISTS public.metadata_dbs (
         nombre_db TEXT PRIMARY KEY,
-        password_descarga TEXT,
-        categoria TEXT,
+        password_descarga TEXT NOT NULL,
+        categoria TEXT DEFAULT 'General',
         imagen TEXT,
         tabla_principal TEXT,
         total_registros BIGINT,
@@ -49,12 +50,14 @@ def inicializar_tablas_supabase():
         configurada BOOLEAN DEFAULT true
     );
 
+    -- 2. Tabla para almacenar los tokens autorizados por cliente
     CREATE TABLE IF NOT EXISTS public.metadata_tokens (
         token TEXT PRIMARY KEY,
-        usuario TEXT,
-        database TEXT
+        usuario TEXT NOT NULL,
+        database TEXT NOT NULL
     );
 
+    -- 3. Tabla de logs globales para auditoría de tráfico
     CREATE TABLE IF NOT EXISTS public.metadata_logs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         token TEXT,
@@ -65,31 +68,39 @@ def inicializar_tablas_supabase():
     );
     """
     
-    # Endpoint de la API REST de Supabase para ejecutar comandos SQL usando la Service Key
-    url_admin_sql = f"{SUPABASE_URL}/admin/api/query"
+    payload = {
+        "query": sql_script
+    }
     
     try:
-        payload = {"query": sql_script}
-        response = requests.post(url_admin_sql, headers=HEADERS_SUPABASE, json=payload, timeout=15)
+        # Petición POST al RPC de la API REST para ejecutar el SQL en el servidor
+        response = requests.post(url_rpc, headers=HEADERS_SUPABASE, json=payload, timeout=15)
         
-        if response.status_code in [200, 201]:
-            print("✅ [SUPABASE] Estructura de base de datos sincronizada y verificada con éxito.")
+        print("==================================================")
+        if response.status_code in [200, 204]:
+            print("🎉 [SUPABASE] Estructura creada o verificada de manera remota con éxito.")
+            print(f"📡 Estado de Kong: Código HTTP {response.status_code} (Procesado)")
         else:
-            print(f"⚠️ [SUPABASE] La API respondió con código {response.status_code} al verificar tablas.")
-            print("💡 Si ya ejecutaste el Script SQL en el editor web de Supabase Studio, puedes ignorar esta alerta.")
-            
+            print(f"❌ Falló el inyector automático de la DB (Código HTTP {response.status_code}):")
+            print(f"📄 Respuesta del servidor: {response.text}")
+        print("==================================================")
+        
     except Exception as e:
-        print(f"❌ [STARTUP_ERROR] No se pudo conectar al inicializador de Supabase: {str(e)}")
+        print(f"❌ [STARTUP_ERROR] Falla física de red al intentar inicializar tablas por API: {str(e)}")
 
 
-# Manejador del ciclo de vida de FastAPI
+# Manejador del ciclo de vida nativo de FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Corre exactamente cuando el contenedor pasa a estado 'RUNNING'
-    inicializar_tablas_supabase()
+    # Forzar la verificación e inyección de tablas antes de aceptar tráfico HTTP
+    inicializar_tablas_desde_la_api()
     yield
 
-app = FastAPI(title="SaaS Orchestrator Core API", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="SaaS Orchestrator Core API", version="3.3.0", lifespan=lifespan)
+
+# Mapear los headers con Prefer para el resto de endpoints REST estándar (PostgREST)
+HEADERS_REST = HEADERS_SUPABASE.copy()
+HEADERS_REST["Prefer"] = "return=representation"
 
 # 🌍 APERTURA TOTAL DE CORS PARA TU FRONTEND HTML CYBERPUNK
 app.add_middleware(
@@ -109,9 +120,9 @@ async def stream_database_httpfs(token: str, db_name: str):
     """Canal de comunicación asíncrono para tus bots externos. DuckDB httpfs consume este endpoint."""
     url_token = f"{SUPABASE_URL}/rest/v1/metadata_tokens?token=eq.{token}&select=usuario,database"
     try:
-        res_token = requests.get(url_token, headers=HEADERS_SUPABASE, timeout=10)
+        res_token = requests.get(url_token, headers=HEADERS_REST, timeout=10)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al conectar con Supabase Auth Link: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error de red con Supabase Auth Link: {str(e)}")
         
     if res_token.status_code != 200 or not res_token.json():
         raise HTTPException(status_code=403, detail="Acceso denegado: Token invalido o revocado")
@@ -126,9 +137,8 @@ async def stream_database_httpfs(token: str, db_name: str):
     if not os.path.exists(ruta_real):
         raise HTTPException(status_code=404, detail="El archivo binario solicitado no existe en la ruta fija")
         
-    # Registrar log de auditoría asíncrono directamente en tu Supabase remoto
     log_payload = {"token": token, "usuario": usuario, "database": db_name, "evento": "Peticion HTTPFS Exitosa"}
-    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_logs", headers=HEADERS_SUPABASE, json=log_payload, timeout=5)
+    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_logs", headers=HEADERS_REST, json=log_payload, timeout=5)
     
     return FileResponse(ruta_real, media_type="application/octet-stream", filename=db_name)
 
@@ -151,9 +161,8 @@ async def obtener_ruta_servidor():
 async def escanear_archivos_nuevos():
     """🔍 ESCÁNER DE ARCHIVOS: Compara el disco contra Supabase y detecta si hay archivos .duckdb nuevos huérfanos."""
     archivos_en_disco = [f for f in os.listdir(DB_DIR) if f.endswith('.duckdb')]
-    
     try:
-        res_dbs = requests.get(f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db", headers=HEADERS_SUPABASE, timeout=10)
+        res_dbs = requests.get(f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db", headers=HEADERS_REST, timeout=10)
         lista_registradas = [r["nombre_db"] for r in res_dbs.json()] if res_dbs.status_code == 200 else []
     except:
         lista_registradas = []
@@ -172,11 +181,9 @@ async def subida_http_directa(file: UploadFile = File(...)):
     """Soporta subidas HTTP directas para archivos estáticos más livianos."""
     if not file.filename.endswith('.duckdb'):
         raise HTTPException(status_code=400, detail="Solo se aceptan archivos .duckdb")
-    
     ruta_destino = os.path.join(DB_DIR, file.filename)
     with open(ruta_destino, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
     return {"status": "success", "message": f"Archivo {file.filename} inyectado por HTTP. Procede a configurarlo."}
 
 
@@ -190,7 +197,7 @@ async def configurar_y_memorizar_db(
     """📝 LINK DE CONFIGURACIÓN OBLIGATORIA: Analiza las tablas/filas de la base detectada y publica la tarjeta en Supabase."""
     ruta_real = os.path.join(DB_DIR, nombre_db)
     if not os.path.exists(ruta_real):
-        raise HTTPException(status_code=404, detail="El archivo binario no se encuentra en la carpeta física del disco")
+        raise HTTPException(status_code=404, detail="El archivo binario no se encuentra en el disco duro")
 
     tabla_detectada = "N/A"
     total_filas = 0
@@ -217,18 +224,14 @@ async def configurar_y_memorizar_db(
         "configurada": True
     }
     
-    headers_upsert = HEADERS_SUPABASE.copy()
+    headers_upsert = HEADERS_REST.copy()
     headers_upsert["Resolution"] = "merge-duplicates"
     requests.post(f"{SUPABASE_URL}/rest/v1/metadata_dbs", headers=headers_upsert, json=db_payload, timeout=10)
 
     return {
         "status": "success",
         "message": f"Base de datos '{nombre_db}' memorizada e indexada con éxito en tu Supabase",
-        "analisis_estructural": {
-            "tabla_maestra": tabla_detectada,
-            "registros_totales": total_filas,
-            "peso_detectado": f"{peso_mb} MB"
-        }
+        "analisis_estructural": {"tabla_maestra": tabla_detectada, "registros_totales": total_filas, "peso_detectado": f"{peso_mb} MB"}
     }
 
 
@@ -238,8 +241,7 @@ async def listar_cartas_saas(categoria: Optional[str] = None):
     url = f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db,categoria,imagen,tabla_principal,total_registros,peso_mb"
     if categoria:
         url += f"&categoria=ilike.{categoria}"
-        
-    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    res = requests.get(url, headers=HEADERS_REST, timeout=10)
     cartas = res.json() if res.status_code == 200 else []
     return {"status": "success", "total_cartas": len(cartas), "databases": cartas}
 
@@ -248,8 +250,7 @@ async def listar_cartas_saas(categoria: Optional[str] = None):
 async def ejecutar_comando_sql(nombre_db: str = Form(...), password: str = Form(...), query: str = Form(...)):
     """⚙️ ICONO CONFIGURACIÓN: Consola para ejecutar sentencias de optimización (Indices/Vacuum) en caliente."""
     url_check = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=password_descarga"
-    res_check = requests.get(url_check, headers=HEADERS_SUPABASE, timeout=10)
-    
+    res_check = requests.get(url_check, headers=HEADERS_REST, timeout=10)
     if res_check.status_code != 200 or not res_check.json() or res_check.json()[0]["password_descarga"] != password:
         raise HTTPException(status_code=401, detail="Contraseña de base de datos incorrecta")
         
@@ -258,17 +259,16 @@ async def ejecutar_comando_sql(nombre_db: str = Form(...), password: str = Form(
         con = duckdb.connect(ruta_db, read_only=False)
         con.execute(query)
         con.close()
-        return {"status": "success", "message": "Sentencia SQL ejecutada e inyectada sobre el binario con exito"}
+        return {"status": "success", "message": "Sentencia SQL ejecutada e inyectada con exito"}
     except Exception as e:
-        return {"status": "error", "detail": f"Error en ejecucion SQL de DuckDB: {str(e)}"}
+        return {"status": "error", "detail": f"Error en DuckDB: {str(e)}"}
 
 
 @app.get("/api/database/spider/{nombre_db}")
 async def araña_estructural(nombre_db: str):
     """🕷️ ICONO ARAÑA: Escanea y retorna las columnas y tipos de datos de la tabla interna de la tarjeta."""
     url = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=tabla_principal"
-    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
-    
+    res = requests.get(url, headers=HEADERS_REST, timeout=10)
     if res.status_code != 200 or not res.json() or res.json()[0]["tabla_principal"] == "N/A":
         return {"status": "success", "tabla": "N/A", "columnas": []}
         
@@ -280,22 +280,20 @@ async def araña_estructural(nombre_db: str):
         con_db.close()
         return {"status": "success", "tabla": tabla, "columnas": [{"campo": c[1], "tipo": c[2]} for c in pragma_info]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error mapeando mapa binario (Spider): {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en Spider: {str(e)}")
 
 
 @app.post("/api/key/generate")
 async def generar_token_acceso(nombre_db: str = Form(...), password: str = Form(...), usuario: str = Form(...)):
     """🔑 ICONO LLAVE: Valida credenciales de la tarjeta y guarda un nuevo token de consulta en Supabase."""
     url_check = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=password_descarga"
-    res_check = requests.get(url_check, headers=HEADERS_SUPABASE, timeout=10)
-    
+    res_check = requests.get(url_check, headers=HEADERS_REST, timeout=10)
     if res_check.status_code != 200 or not res_check.json() or res_check.json()[0]["password_descarga"] != password:
         raise HTTPException(status_code=401, detail="Contraseña de la base de datos incorrecta")
         
     nuevo_token = f"tkn_{uuid.uuid4().hex[:16]}"
     token_payload = {"token": nuevo_token, "usuario": usuario, "database": nombre_db}
-    
-    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_tokens", headers=HEADERS_SUPABASE, json=token_payload, timeout=10)
+    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_tokens", headers=HEADERS_REST, json=token_payload, timeout=10)
     
     return {
         "status": "success",
@@ -310,22 +308,18 @@ async def generar_token_acceso(nombre_db: str = Form(...), password: str = Form(
 async def ver_usuarios_permitidos(nombre_db: str):
     """👥 PESTAÑA USUARIOS: Retorna el array JSON de todos los clientes autorizados de esta tarjeta."""
     url = f"{SUPABASE_URL}/rest/v1/metadata_tokens?database=eq.{nombre_db}&select=usuario,token"
-    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    res = requests.get(url, headers=HEADERS_REST, timeout=10)
     records = res.json() if res.status_code == 200 else []
-    
-    usuarios = [{"usuario": r["usuario"], "token_key": r["token"]} for r in records]
-    return {"status": "success", "database": nombre_db, "usuarios_autorizados": usuarios}
+    return {"status": "success", "database": nombre_db, "usuarios_autorizados": [{"usuario": r["usuario"], "token_key": r["token"]} for r in records]}
 
 
 @app.get("/api/network/logs")
 async def ver_logs_trafico_red():
     """📡 BARRA SUPERIOR (CONEXIONES): Devuelve el registro de auditoría en red directamente de tu Supabase."""
     url = f"{SUPABASE_URL}/rest/v1/metadata_logs?select=token,usuario,database,evento,fecha&order=fecha.desc&limit=15"
-    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    res = requests.get(url, headers=HEADERS_REST, timeout=10)
     records = res.json() if res.status_code == 200 else []
-    
-    logs = [{"token": r["token"], "usuario": r["usuario"], "database": r["database"], "evento": r["evento"], "timestamp": r["fecha"]} for r in records]
-    return {"status": "success", "total_peticiones_recientes": len(logs), "conexiones_logs": logs}
+    return {"status": "success", "conexiones_logs": [{"token": r["token"], "usuario": r["usuario"], "database": r["database"], "evento": r["evento"], "timestamp": r["fecha"]} for r in records]}
 
 if __name__ == "__main__":
     import uvicorn
