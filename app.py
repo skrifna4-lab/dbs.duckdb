@@ -16,7 +16,7 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 # Inicializar FastAPI (Controlador maestro para peticiones remotas concurrentes vía HTTPFS)
 app = FastAPI(title="Cyberpunk DuckDB SaaS Orchestrator")
 
-# 🌍 APERTURA TOTAL DE CORS: Permite conexiones y flujos cruzados desde cualquier parte del mundo
+# 🌍 APERTURA TOTAL DE CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,11 +40,6 @@ def guardar_sistema(data):
 # 🌐 ENDPOINT MAESTRO: Transferencia asíncrona de bloques binarios (HTTPFS)
 @app.get("/stream/{token}/{db_name}")
 async def stream_database_httpfs(token: str, db_name: str):
-    """
-    Soporta flujos y peticiones de rango HTTP (HTTP Range Requests).
-    Hace que un DuckDB externo remoto no descargue los gigabytes del archivo completo, 
-    sino que extraiga únicamente los fragmentos del DNI consultado en milisegundos.
-    """
     data = cargar_sistema()
     
     if token not in data["tokens"]:
@@ -58,7 +53,6 @@ async def stream_database_httpfs(token: str, db_name: str):
     if not os.path.exists(ruta_archivo):
         raise HTTPException(status_code=404, detail="El archivo binario .duckdb solicitado no existe")
         
-    # Registrar log dinámico de conexión para auditoría
     data["logs"].append({
         "token": token,
         "usuario": token_info["usuario"],
@@ -72,7 +66,6 @@ async def stream_database_httpfs(token: str, db_name: str):
 # ⬇️ ENDPOINT DE DESCARGA PROTEGIDA POR CONTRASEÑA
 @app.get("/download/{db_name}")
 async def descargar_archivo_completo(db_name: str, password: str):
-    """Permite bajar el binario completo únicamente si coincide la contraseña maestra asignada."""
     data = cargar_sistema()
     if db_name not in data["databases"]:
         raise HTTPException(status_code=404, detail="Base de datos no registrada")
@@ -98,11 +91,10 @@ def procesar_subida_inicial(archivos):
     ruta_final = os.path.join(STORAGE_DIR, nombre_base)
     os.replace(archivo.name, ruta_final)
     
-    # Abrir bloque de configuración obligatoria antes de liberar la BD al ecosistema público
     data = cargar_sistema()
     dbs_actuales = list(data["databases"].keys()) + [nombre_base]
     
-    return gr.update(visible=True), f"📥 Archivo temporal '{nombre_base}' inyectado. Configura su contraseña maestra abajo para guardarlo.", gr.update(choices=list(set(dbs_actuales)), value=nombre_base)
+    return gr.update(visible=True), f"📥 Archivo '{nombre_base}' inyectado. Configura su contraseña maestra abajo para guardarlo.", gr.update(choices=list(set(dbs_actuales)), value=nombre_base)
 
 def confirmar_configuracion_db(nombre_db, pwd_descarga):
     if not nombre_db or nombre_db == "No hay bases de datos seleccionadas":
@@ -116,7 +108,6 @@ def confirmar_configuracion_db(nombre_db, pwd_descarga):
     tabla_detectada = "N/A"
     total_filas = 0
     
-    # Escaneo inicial inmediato de metadatos estructurales
     try:
         con = duckdb.connect(ruta_db, read_only=True)
         tablas = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main';").fetchall()
@@ -138,7 +129,6 @@ def confirmar_configuracion_db(nombre_db, pwd_descarga):
     return f"🔒 ¡Configuración Exitosa! La base de datos '{nombre_db}' ya está activa en tu Panel de Control."
 
 def ejecutar_comando_consola(nombre_db, pwd_db, comando_sql):
-    """⚙️ MÓDULO CONFIGURACIÓN: Ejecuta comandos estructurales directo sobre el archivo física (Índices/Ajustes)."""
     data = cargar_sistema()
     if not nombre_db or nombre_db not in data["databases"]:
         return "❌ Selecciona una base de datos activa."
@@ -155,7 +145,6 @@ def ejecutar_comando_consola(nombre_db, pwd_db, comando_sql):
         return f"❌ Error del motor SQL de DuckDB: {str(e)}"
 
 def obtener_estructura_completa(nombre_db):
-    """🕷️ MÓDULO ARAÑA: Analiza cabeceras binarias mapeando campos y tipos de datos."""
     data = cargar_sistema()
     if not nombre_db or nombre_db not in data["databases"]:
         return "Selecciona una base de datos primero."
@@ -177,7 +166,6 @@ def obtener_estructura_completa(nombre_db):
         return f"❌ Falla al lanzar petición sobre la araña: {str(e)}"
 
 def generar_key_consulta(nombre_db, pwd_db, nombre_usuario):
-    """🔑 MÓDULO LLAVE: Crea credenciales cifradas y genera las URLs asíncronas para tus bots externos."""
     if not nombre_usuario:
         return "❌ Introduce el nombre del usuario o bot asignado.", ""
     data = cargar_sistema()
@@ -201,14 +189,13 @@ def generar_key_consulta(nombre_db, pwd_db, nombre_usuario):
         f"con = duckdb.connect(':memory:')\n"
         f"con.execute('INSTALL httpfs; LOAD httpfs;')\n"
         f"con.execute(\"SET enable_http_metadata_cache=true;\")\n\n"
-        f"# Conexión por bloques binarios instantánea (Sin descargar todo el archivo):\n"
+        f"# Conexión por bloques binarios instantánea:\n"
         f"con.execute(\"ATTACH '{url_final}' AS remote_db (READ_ONLY);\")\n"
         f"print('¡Conexión remota exitosa con la base de datos estática!')\n"
     )
     return "✅ Token de consulta estructurado correctamente.", codigo_snip
 
 def listar_usuarios_db(nombre_db):
-    """👥 VISUALIZADOR DE CLIENTES: Muestra los usuarios enlazados al archivo actual."""
     data = cargar_sistema()
     usuarios = []
     for tkn, info in data["tokens"].items():
@@ -217,7 +204,6 @@ def listar_usuarios_db(nombre_db):
     return "\n".join(usuarios) if usuarios else "No se registran credenciales de usuarios para este archivo binario."
 
 def renderizar_logs_conexiones():
-    """📡 SECCIÓN AUDITORÍA: Captura e inyecta los logs globales en tiempo real."""
     data = cargar_sistema()
     if not data["logs"]:
         return "Sin tráfico registrado en la red actualmente."
@@ -230,8 +216,8 @@ def actualizar_choices_db():
     return gr.update(choices=choices if choices else ["No hay bases de datos seleccionadas"])
 
 
-# 🎨 COMPOSICIÓN DE LA INTERFAZ GRÁFICA (Cyberpunk / Synthwave Monocromático)
-with gr.Blocks(title="Base Engine Control Panel", theme=gr.themes.Monochrome()) as ui:
+# 🎨 COMPOSICIÓN DE LA INTERFAZ GRÁFICA CORREGIDA (Compatible con Gradio 5.x y 6.x)
+with gr.Blocks(analytics_enabled=False, theme=gr.themes.Monochrome()) as ui:
     gr.Markdown("# 🌌 INTERFAZ DE CONTROL GENERAL: ORQUESTADOR DUCKDB SAAS")
     gr.Markdown("Controlador centralizado para inyección, tuning y distribución asíncrona de bases de datos estáticas.")
     
@@ -248,8 +234,8 @@ with gr.Blocks(title="Base Engine Control Panel", theme=gr.themes.Monochrome()) 
         btn_upload = gr.Button("🚀 Inyectar al Servidor Permanente", variant="primary")
         upload_log = gr.Textbox(label="Estado del Canal Físico de Carga", interactive=False)
         
-        # Link / Modal de Configuración Obligatoria antes de pasar a producción
-        with gr.Box(visible=False) as modal_config:
+        # 🛠️ SOLUCIÓN AL ERROR: Cambiado gr.Box por gr.Group (Estilo contenedor moderno)
+        with gr.Group(visible=False) as modal_config:
             gr.Markdown("### ⚙️ Link de Configuración de Archivo Requerido")
             pwd_descarga_input = gr.Textbox(label="Establece la Contraseña de Descarga y Seguridad Maestra", type="password")
             btn_guardar_config = gr.Button("🔒 Confirmar Parámetros y Activar Tarjeta", variant="primary")
@@ -264,7 +250,8 @@ with gr.Blocks(title="Base Engine Control Panel", theme=gr.themes.Monochrome()) 
             
         btn_refresh_dropdown.click(actualizar_choices_db, outputs=[selector_db])
         
-        with gr.Box():
+        # 🛠️ SOLUCIÓN AL ERROR: Cambiado gr.Box por gr.Group
+        with gr.Group():
             info_meta = gr.Markdown("## 📭 Ninguna Base de Datos Desplegada\nSelecciona un archivo del menú superior para activar los controles asíncronos.")
             
             with gr.Tab("⚙️ Configuración (Comandos)"):
@@ -300,7 +287,6 @@ with gr.Blocks(title="Base Engine Control Panel", theme=gr.themes.Monochrome()) 
                 
                 btn_users.click(listar_usuarios_db, inputs=[selector_db], outputs=[out_users])
 
-    # Lógica de enlace para el cargador dinámico
     def refrescar_cabecera_tarjeta(db):
         if not db or db == "No hay bases de datos seleccionadas":
             return "## 📭 Selecciona una base de datos válida."
@@ -314,7 +300,7 @@ with gr.Blocks(title="Base Engine Control Panel", theme=gr.themes.Monochrome()) 
     btn_guardar_config.click(confirmar_configuracion_db, inputs=[selector_db, pwd_descarga_input], outputs=[config_status])
     selector_db.change(refrescar_cabecera_tarjeta, inputs=[selector_db], outputs=[info_meta])
 
-# Unificar la interfaz gráfica interactiva de Gradio con los endpoints de red de FastAPI
+# Unificar la interfaz con FastAPI
 app = gr.mount_gradio_app(app, ui, path="/")
 
 if __name__ == "__main__":
