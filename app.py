@@ -2,21 +2,26 @@ import os
 import json
 import duckdb
 import uuid
-from fastapi import FastAPI, HTTPException
+import shutil
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import gradio as gr
+from fastapi.staticfiles import StaticFiles
 
-# 📁 Configuración estructural de volúmenes permanentes
+# 📁 Configuración del volumen persistente de Docker
 STORAGE_DIR = "/app/storage"
+DB_DIR = os.path.join(STORAGE_DIR, "databases")
+IMG_DIR = os.path.join(STORAGE_DIR, "images")
 METADATA_FILE = os.path.join(STORAGE_DIR, "system_metadata.json")
 
-os.makedirs(STORAGE_DIR, exist_ok=True)
+# Asegurar directorios limpios
+os.makedirs(DB_DIR, exist_ok=True)
+os.makedirs(IMG_DIR, exist_ok=True)
 
-# Inicializar FastAPI (Controlador maestro para peticiones remotas concurrentes vía HTTPFS)
-app = FastAPI(title="Cyberpunk DuckDB SaaS Orchestrator")
+app = FastAPI(title="Core SaaS DuckDB API", version="2.0.0")
 
-# 🌍 APERTURA TOTAL DE CORS
+# 🌍 CORS TOTAL Abierto para que tu interfaz se conecte desde cualquier frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +30,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 💾 Gestores de persistencia JSON (Inmunes a redespliegues)
+# 🖼️ Servir las imágenes subidas de forma estática para que tu interfaz pueda pintarlas usando URLs
+app.mount("/static-images", StaticFiles(directory=IMG_DIR), name="images")
+
+# 💾 Gestor del estado e indexación del volumen (Inmune a reinicios)
 def cargar_sistema():
     if os.path.exists(METADATA_FILE):
         with open(METADATA_FILE, "r") as f:
@@ -37,273 +45,215 @@ def guardar_sistema(data):
     with open(METADATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-# 🌐 ENDPOINT MAESTRO: Transferencia asíncrona de bloques binarios (HTTPFS)
-@app.get("/stream/{token}/{db_name}")
+
+# =====================================================================
+# 🌐 ENDPOINT DE TRANSFERENCIA BINARIA POR BLOQUES (HTTPFS DUCKDB)
+# =====================================================================
+@app.get("/api/stream/{token}/{db_name}")
 async def stream_database_httpfs(token: str, db_name: str):
+    """Soporta peticiones de rango HTTP. Es el core del método veloz HTTPFS."""
     data = cargar_sistema()
     
     if token not in data["tokens"]:
-        raise HTTPException(status_code=403, detail="Acceso denegado: Token inválido o revocado")
+        raise HTTPException(status_code=403, detail="Token invalido o revocado")
         
     token_info = data["tokens"][token]
     if token_info["database"] != db_name:
-        raise HTTPException(status_code=403, detail="Acceso denegado: Token no autorizado para esta BD")
+        raise HTTPException(status_code=403, detail="Token sin autorizacion para esta base de datos")
         
-    ruta_archivo = os.path.join(STORAGE_DIR, db_name)
+    ruta_archivo = os.path.join(DB_DIR, db_name)
     if not os.path.exists(ruta_archivo):
-        raise HTTPException(status_code=404, detail="El archivo binario .duckdb solicitado no existe")
+        raise HTTPException(status_code=404, detail="El archivo binario .duckdb no existe")
         
+    # Registrar log de auditoría
     data["logs"].append({
         "token": token,
         "usuario": token_info["usuario"],
         "database": db_name,
-        "evento": "Petición HTTPFS Exitosa"
+        "evento": "Peticion HTTPFS exitosa"
     })
     guardar_sistema(data)
     
     return FileResponse(ruta_archivo, media_type="application/octet-stream", filename=db_name)
 
-# ⬇️ ENDPOINT DE DESCARGA PROTEGIDA POR CONTRASEÑA
-@app.get("/download/{db_name}")
-async def descargar_archivo_completo(db_name: str, password: str):
-    data = cargar_sistema()
-    if db_name not in data["databases"]:
-        raise HTTPException(status_code=404, detail="Base de datos no registrada")
-        
-    if data["databases"][db_name]["password_descarga"] != password:
-        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
-        
-    ruta_archivo = os.path.join(STORAGE_DIR, db_name)
-    return FileResponse(ruta_archivo, media_type="application/octet-stream", filename=db_name)
 
+# =====================================================================
+# 🛠️ ENDPOINTS DEL BACKEND (RESPUESTAS EN JSON PURO PARA TU INTERFAZ)
+# =====================================================================
 
-# ⚙️ CONTROLADORES LOGICÓ-VISUALES
-def procesar_subida_inicial(archivos):
-    if not archivos:
-        return gr.update(visible=False), "⚠️ No seleccionaste ningún archivo.", gr.update(choices=[])
-    
-    archivo = archivos[0]
-    nombre_base = os.path.basename(archivo.name)
-    
-    if not nombre_base.endswith('.duckdb'):
-        return gr.update(visible=False), "❌ Error crítico: Este sistema solo acepta extensiones de motor .duckdb", gr.update(choices=[])
-        
-    ruta_final = os.path.join(STORAGE_DIR, nombre_base)
-    os.replace(archivo.name, ruta_final)
-    
-    data = cargar_sistema()
-    dbs_actuales = list(data["databases"].keys()) + [nombre_base]
-    
-    return gr.update(visible=True), f"📥 Archivo '{nombre_base}' inyectado. Configura su contraseña maestra abajo para guardarlo.", gr.update(choices=list(set(dbs_actuales)), value=nombre_base)
-
-def confirmar_configuracion_db(nombre_db, pwd_descarga):
-    if not nombre_db or nombre_db == "No hay bases de datos seleccionadas":
-        return "❌ Error: Selecciona o sube una base de datos válida primero."
-    if not pwd_descarga:
-        return "❌ Debes definir una contraseña obligatoria para proteger el archivo."
+@app.post("/api/database/upload")
+async def subir_e_indexar_db(
+    file: UploadFile = File(...),
+    password_descarga: str = Form(...),
+    categoria: str = Form("General"),
+    imagen_url: Optional[str] = Form(None),
+    imagen_file: Optional[UploadFile] = File(None)
+):
+    """
+    Inyecta el archivo .duckdb, valida la extensión, procesa la imagen
+    (sea por link o subida física), extrae los metadatos y guarda todo en JSON.
+    """
+    if not file.filename.endswith('.duckdb'):
+        raise HTTPException(status_code=400, detail="El sistema solo acepta archivos con extension nativa .duckdb")
         
     data = cargar_sistema()
-    ruta_db = os.path.join(STORAGE_DIR, nombre_db)
+    nombre_db = file.filename
+    ruta_final_db = os.path.join(DB_DIR, nombre_db)
     
+    # 🚀 Guardado veloz del binario
+    with open(ruta_final_db, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Procesar Imagen (Prioridad: Archivo subido > URL por Link)
+    url_final_imagen = imagen_url or ""
+    if imagen_file and imagen_file.filename:
+        ext = os.path.splitext(imagen_file.filename)[1]
+        nombre_img_seguro = f"{uuid.uuid4().hex}{ext}"
+        ruta_final_img = os.path.join(IMG_DIR, nombre_img_seguro)
+        
+        with open(ruta_final_img, "wb") as buffer:
+            shutil.copyfileobj(imagen_file.file, buffer)
+        # Tu interfaz podrá llamar a la imagen usando esta ruta relativa del servidor
+        url_final_imagen = f"/static-images/{nombre_img_seguro}"
+
+    # Escaneo y conteo automático de registros internos usando DuckDB nativo
     tabla_detectada = "N/A"
     total_filas = 0
-    
     try:
-        con = duckdb.connect(ruta_db, read_only=True)
+        con = duckdb.connect(ruta_final_db, read_only=True)
         tablas = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main';").fetchall()
         if tablas:
             tabla_detectada = tablas[0][0]
-            count_res = con.execute(f"SELECT COUNT(*) FROM {tabla_detectada};").fetchone()
-            total_filas = count_res[0]
+            total_filas = con.execute(f"SELECT COUNT(*) FROM {tabla_detectada};").fetchone()[0]
         con.close()
     except Exception as e:
-        print(f"Error indexando en caliente: {str(e)}")
+        print(f"Error extrayendo estructura: {str(e)}")
 
+    # Indexar la base de datos en los metadatos JSON organizados por categorías
     data["databases"][nombre_db] = {
-        "password_descarga": pwd_descarga,
+        "password_descarga": password_descarga,
+        "categoria": categoria,
+        "imagen": url_final_imagen,
         "tabla_principal": tabla_detectada,
-        "total_registros": f"{total_filas:,}",
-        "peso": f"{os.path.getsize(ruta_db) / (1024*1024):.2f} MB"
+        "total_registros": total_filas,
+        "peso_mb": round(os.path.getsize(ruta_final_db) / (1024*1024), 2)
     }
     guardar_sistema(data)
-    return f"🔒 ¡Configuración Exitosa! La base de datos '{nombre_db}' ya está activa en tu Panel de Control."
+    
+    return {
+        "status": "success",
+        "message": f"Base de datos {nombre_db} configurada correctamente",
+        "metadata": data["databases"][nombre_db]
+    }
 
-def ejecutar_comando_consola(nombre_db, pwd_db, comando_sql):
+
+@app.get("/api/database/list")
+async def listar_bases_de_datos(categoria: Optional[str] = None):
+    """Devuelve la lista completa de cartas/bases de datos en JSON, filtrable por categoria."""
     data = cargar_sistema()
-    if not nombre_db or nombre_db not in data["databases"]:
-        return "❌ Selecciona una base de datos activa."
-    if data["databases"][nombre_db]["password_descarga"] != pwd_db:
-        return "❌ Autenticación fallida: Contraseña de base de datos incorrecta."
+    dbs = data["databases"]
+    
+    if categoria:
+        # Filtramos el diccionario en base a la categoría que mande tu interfaz
+        dbs = {k: v for k, v in dbs.items() if v["categoria"].lower() == categoria.lower()}
         
-    ruta_db = os.path.join(STORAGE_DIR, nombre_db)
+    return {"status": "success", "total": len(dbs), "databases": dbs}
+
+
+@app.post("/api/database/console")
+async def ejecutar_comando_sql(nombre_db: str = Form(...), password: str = Form(...), query: str = Form(...)):
+    """⚙️ ICONO CONFIGURACIÓN: Ejecuta comandos (Tunear índices, borrar datos) y devuelve JSON."""
+    data = cargar_sistema()
+    if nombre_db not in data["databases"]:
+        raise HTTPException(status_code=404, detail="Base de datos no registrada")
+    if data["databases"][nombre_db]["password_descarga"] != password:
+        raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+        
+    ruta_db = os.path.join(DB_DIR, nombre_db)
     try:
         con = duckdb.connect(ruta_db, read_only=False)
-        con.execute(comando_sql)
+        con.execute(query)
         con.close()
-        return "⚡ Sentencia SQL inyectada y procesada de forma exitosa sobre el binario."
+        return {"status": "success", "message": "Query procesada y guardada en el binario con exito"}
     except Exception as e:
-        return f"❌ Error del motor SQL de DuckDB: {str(e)}"
+        return {"status": "error", "detail": f"Error SQL: {str(e)}"}
 
-def obtener_estructura_completa(nombre_db):
+
+@app.get("/api/database/spider/{nombre_db}")
+async def araña_estructural(nombre_db: str):
+    """🕷️ ICONO ARAÑA: Devuelve el esquema binario completo de columnas de la tabla principal en JSON."""
     data = cargar_sistema()
-    if not nombre_db or nombre_db not in data["databases"]:
-        return "Selecciona una base de datos primero."
+    if nombre_db not in data["databases"]:
+        raise HTTPException(status_code=404, detail="Base de datos no registrada")
         
-    ruta_db = os.path.join(STORAGE_DIR, nombre_db)
+    ruta_db = os.path.join(DB_DIR, nombre_db)
+    tabla = data["databases"][nombre_db]["tabla_principal"]
+    
+    if tabla == "N/A":
+        return {"status": "success", "tabla": "N/A", "columnas": []}
+        
     try:
         con = duckdb.connect(ruta_db, read_only=True)
-        tabla = data["databases"][nombre_db]["tabla_principal"]
-        if tabla != "N/A":
-            info = con.execute(f"PRAGMA table_info('{tabla}');").fetchall()
-            estructura = f"📋 Catálogo Estructural de Columnas para [{tabla}]:\n\n"
-            for col in info:
-                estructura += f" 🔹 Campo: {col[1].ljust(18)} | Tipo: {col[2]}\n"
-        else:
-            estructura = "No se detectaron tablas públicas estructuradas en el catálogo principal."
+        pragma_info = con.execute(f"PRAGMA table_info('{tabla}');").fetchall()
         con.close()
-        return estructura
+        
+        columnas_json = [{"cid": c[0], "name": c[1], "type": c[2]} for c in pragma_info]
+        return {"status": "success", "tabla": tabla, "columnas": columnas_json}
     except Exception as e:
-        return f"❌ Falla al lanzar petición sobre la araña: {str(e)}"
+        raise HTTPException(status_code=500, detail=f"Error al leer estructura: {str(e)}")
 
-def generar_key_consulta(nombre_db, pwd_db, nombre_usuario):
-    if not nombre_usuario:
-        return "❌ Introduce el nombre del usuario o bot asignado.", ""
+
+@app.post("/api/key/generate")
+async def generar_llave_acceso(nombre_db: str = Form(...), password: str = Form(...), usuario: str = Form(...)):
+    """🔑 ICONO LLAVE: Valida credenciales de la tarjeta y retorna el Token y string de conexion en JSON."""
     data = cargar_sistema()
-    if not nombre_db or nombre_db not in data["databases"]:
-        return "❌ Selecciona una base de datos válida.", ""
-    if data["databases"][nombre_db]["password_descarga"] != pwd_db:
-        return "❌ Autenticación fallida: Contraseña incorrecta.", ""
+    if nombre_db not in data["databases"]:
+        raise HTTPException(status_code=404, detail="Base de datos no encontrada")
+    if data["databases"][nombre_db]["password_descarga"] != password:
+        raise HTTPException(status_code=401, detail="Contraseña maestra incorrecta")
         
     nuevo_token = f"tkn_{uuid.uuid4().hex[:16]}"
     data["tokens"][nuevo_token] = {
-        "usuario": nombre_usuario,
+        "usuario": usuario,
         "database": nombre_db
     }
     guardar_sistema(data)
     
-    url_final = f"http://TU_DOMINIO_DOKPLOY.sslip.io/stream/{nuevo_token}/{nombre_db}"
+    # URL que usará el bot externo para conectarse
+    url_stream = f"/api/stream/{nuevo_token}/{nombre_db}"
     
-    codigo_snip = (
-        f"# Bloque de conexión remota optimizado con CORS libre para tu Bot externo\n"
-        f"import duckdb\n\n"
-        f"con = duckdb.connect(':memory:')\n"
-        f"con.execute('INSTALL httpfs; LOAD httpfs;')\n"
-        f"con.execute(\"SET enable_http_metadata_cache=true;\")\n\n"
-        f"# Conexión por bloques binarios instantánea:\n"
-        f"con.execute(\"ATTACH '{url_final}' AS remote_db (READ_ONLY);\")\n"
-        f"print('¡Conexión remota exitosa con la base de datos estática!')\n"
-    )
-    return "✅ Token de consulta estructurado correctamente.", codigo_snip
+    return {
+        "status": "success",
+        "token": nuevo_token,
+        "usuario": usuario,
+        "database": nombre_db,
+        "endpoint_stream_path": url_stream
+    }
 
-def listar_usuarios_db(nombre_db):
+
+@app.get("/api/key/users/{nombre_db}")
+async def listar_usuarios_autorizados(nombre_db: str):
+    """👥 PESTAÑA USUARIOS: Retorna el array JSON de todas las llaves y personas atadas a esa carta."""
     data = cargar_sistema()
-    usuarios = []
-    for tkn, info in data["tokens"].items():
+    usuarios_vinculados = []
+    
+    for token, info in data["tokens"].items():
         if info["database"] == nombre_db:
-            usuarios.append(f"👤 Cliente: {info['usuario'].ljust(15)} | 🔑 Key Asignada: {tkn}")
-    return "\n".join(usuarios) if usuarios else "No se registran credenciales de usuarios para este archivo binario."
+            usuarios_vinculados.append({
+                "usuario": info["usuario"],
+                "token": token
+            })
+            
+    return {"status": "success", "database": nombre_db, "users": usuarios_vinculados}
 
-def renderizar_logs_conexiones():
+
+@app.get("/api/network/logs")
+async def ver_logs_trafico_red():
+    """📡 BARRA SUPERIOR: Devuelve las ultimas 20 peticiones registradas de auditoria en JSON."""
     data = cargar_sistema()
-    if not data["logs"]:
-        return "Sin tráfico registrado en la red actualmente."
-    lineas = [f"📡 [Tráfico] Usuario: {l['usuario']} -> Base: {l['database']} ({l['evento']})" for l in data["logs"][-12:]]
-    return "\n".join(reversed(lineas))
-
-def actualizar_choices_db():
-    data = cargar_sistema()
-    choices = list(data["databases"].keys())
-    return gr.update(choices=choices if choices else ["No hay bases de datos seleccionadas"])
-
-
-# 🎨 COMPOSICIÓN DE LA INTERFAZ GRÁFICA CORREGIDA (Compatible con Gradio 5.x y 6.x)
-with gr.Blocks(analytics_enabled=False, theme=gr.themes.Monochrome()) as ui:
-    gr.Markdown("# 🌌 INTERFAZ DE CONTROL GENERAL: ORQUESTADOR DUCKDB SAAS")
-    gr.Markdown("Controlador centralizado para inyección, tuning y distribución asíncrona de bases de datos estáticas.")
-    
-    with gr.Row():
-        with gr.Column(scale=2):
-            gr.Markdown("### 📡 Conexiones de Red y Colección de Datos Globales")
-            logs_box = gr.TextArea(value=renderizar_logs_conexiones(), label="Logs de Auditoría en Red (CORS Global Abierto)", interactive=False, lines=4)
-            btn_refresh_logs = gr.Button("🔄 Refrescar Tráfico de Peticiones", size="sm")
-            btn_refresh_logs.click(renderizar_logs_conexiones, outputs=[logs_box])
-            
-    with gr.Tab("📤 Carga Binaria e Inyección Rápida"):
-        gr.Markdown("### 📥 Método de Transferencia por Bloques Binarios")
-        uploader = gr.File(label="Arrastra tu base de datos masiva .duckdb aquí", file_types=[".duckdb"])
-        btn_upload = gr.Button("🚀 Inyectar al Servidor Permanente", variant="primary")
-        upload_log = gr.Textbox(label="Estado del Canal Físico de Carga", interactive=False)
-        
-        # 🛠️ SOLUCIÓN AL ERROR: Cambiado gr.Box por gr.Group (Estilo contenedor moderno)
-        with gr.Group(visible=False) as modal_config:
-            gr.Markdown("### ⚙️ Link de Configuración de Archivo Requerido")
-            pwd_descarga_input = gr.Textbox(label="Establece la Contraseña de Descarga y Seguridad Maestra", type="password")
-            btn_guardar_config = gr.Button("🔒 Confirmar Parámetros y Activar Tarjeta", variant="primary")
-            config_status = gr.Textbox(label="Estado de Activación", interactive=False)
-            
-    with gr.Tab("🎴 Panel de Tarjetas e Infraestructura"):
-        gr.Markdown("### 🃏 Cartas de Control de Bases de Datos Activas")
-        
-        with gr.Row():
-            selector_db = gr.Dropdown(choices=list(cargar_sistema()["databases"].keys()), label="Selecciona la Base de Datos para inicializar los bracitos de acción")
-            btn_refresh_dropdown = gr.Button("🔄 Refrescar Lista de Cartas", size="sm")
-            
-        btn_refresh_dropdown.click(actualizar_choices_db, outputs=[selector_db])
-        
-        # 🛠️ SOLUCIÓN AL ERROR: Cambiado gr.Box por gr.Group
-        with gr.Group():
-            info_meta = gr.Markdown("## 📭 Ninguna Base de Datos Desplegada\nSelecciona un archivo del menú superior para activar los controles asíncronos.")
-            
-            with gr.Tab("⚙️ Configuración (Comandos)"):
-                gr.Markdown("#### ⚙️ Consola de optimización interna. Agrega o modifica índices en caliente.")
-                pwd_admin = gr.Textbox(label="Contraseña Maestra de la Base de Datos", type="password")
-                cmd_sql = gr.Textbox(label="Comando SQL Ejecutivo (ej: CREATE INDEX idx_dni ON personas (DNI);)")
-                btn_sql = gr.Button("Ejecutar Query sobre el Binario", variant="primary")
-                out_sql = gr.Textbox(label="Consola de Respuesta del Motor", interactive=False)
-                
-                btn_sql.click(ejecutar_comando_consola, inputs=[selector_db, pwd_admin, cmd_sql], outputs=[out_sql])
-            
-            with gr.Tab("🕷️ Estructura Física (Araña)"):
-                gr.Markdown("#### 🕷️ Petición estructural automática al catálogo de metadatos.")
-                btn_spider = gr.Button("🕸️ Lanzar Petición Estructural", variant="primary")
-                out_spider = gr.TextArea(label="Mapeo de Esquema Binario Detectado", interactive=False)
-                
-                btn_spider.click(obtener_estructura_completa, inputs=[selector_db], outputs=[out_spider])
-                
-            with gr.Tab("🔑 Generar Key"):
-                gr.Markdown("#### 🔑 Generación de tokens individuales de acceso por cliente con CORS abierto.")
-                pwd_key = gr.Textbox(label="Contraseña Maestra de la Base de Datos", type="password")
-                user_name = gr.Textbox(label="Identificador o Nombre del Usuario Beneficiario")
-                btn_key = gr.Button("⚡ Generar Llave de Consulta Segura", variant="primary")
-                out_key_status = gr.Textbox(label="Estado del Token", interactive=False)
-                out_key_code = gr.TextArea(label="String de Conexión HTTPFS Completo para tu Bot", interactive=False)
-                
-                btn_key.click(generar_key_consulta, inputs=[selector_db, pwd_key, user_name], outputs=[out_key_status, out_key_code])
-                
-            with gr.Tab("👥 Usuarios Permitidos"):
-                gr.Markdown("#### 👥 Visibilidad del Ecosistema: Consulta qué usuarios tienen llaves creadas.")
-                btn_users = gr.Button("📋 Listar Usuarios Vinculados", variant="primary")
-                out_users = gr.TextArea(label="Usuarios y Tokens activos para esta Base de Datos", interactive=False)
-                
-                btn_users.click(listar_usuarios_db, inputs=[selector_db], outputs=[out_users])
-
-    def refrescar_cabecera_tarjeta(db):
-        if not db or db == "No hay bases de datos seleccionadas":
-            return "## 📭 Selecciona una base de datos válida."
-        data = cargar_sistema()
-        if db not in data["databases"]: 
-            return "## ⚠️ Base de datos en proceso de configuración."
-        info = data["databases"][db]
-        return f"## 📊 Base de Datos Activa: `{db}`\n* **Peso en Disco:** {info['peso']} | **Tabla Principal:** {info['tabla_principal']} | **Total Registros:** {info['total_registros']}*"
-
-    btn_upload.click(procesar_subida_inicial, inputs=[uploader], outputs=[modal_config, upload_log, selector_db])
-    btn_guardar_config.click(confirmar_configuracion_db, inputs=[selector_db, pwd_descarga_input], outputs=[config_status])
-    selector_db.change(refrescar_cabecera_tarjeta, inputs=[selector_db], outputs=[info_meta])
-
-# Unificar la interfaz con FastAPI
-app = gr.mount_gradio_app(app, ui, path="/")
+    return {"status": "success", "logs": data["logs"][-20:]}
 
 if __name__ == "__main__":
     import uvicorn
-    # Lanzamiento nativo en el puerto 7860 expuesto por el Dockerfile
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    # Lanzar FastAPI puro en el puerto 8000
+    uvicorn.run(app, host="0.0.0.0", port=8000)
