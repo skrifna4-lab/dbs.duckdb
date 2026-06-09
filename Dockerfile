@@ -2,31 +2,27 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Instalar dependencias del sistema esenciales para DuckDB y SSH/SFTP si se requieren
+# Instalar dependencias esenciales del sistema para DuckDB y compilaciones atómicas
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar librerías de Python requeridas
-RUN pip install --no-cache-dir \
-    gradio \
-    duckdb \
-    pandas \
-    cryptography
+# Copiar e instalar los requerimientos optimizando la caché de pip
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Crear el directorio donde se guardarán las bases de datos estáticas de forma persistente
+# Crear el directorio raíz para el volumen de datos permanente
 RUN mkdir -p /app/storage
 
-# Copiar el código fuente de la aplicación
+# Copiar el backend de control central
 COPY app.py .
 
-# 🔐 CLAVE DE LA PERSISTENCIA: Declaramos este directorio como volumen. 
-# Dokploy mantendrá todo lo que caiga aquí a salvo, sin importar si borras el contenedor.
+# 🔐 INMUNIDAD DE VOLUMEN: Mapeo nativo para resguardar la información ante reinicios
 VOLUME ["/app/storage"]
 
-# Exponer el puerto nativo de la interfaz web de Gradio
+# Exponer el puerto de transmisión masiva e interfaz gráfica unificada
 EXPOSE 7860
 
-# Ejecutar el panel de control
+# Ejecutar el script en modo unbuffered para capturar los logs binarios de red al instante
 CMD ["python", "-u", "app.py"]
