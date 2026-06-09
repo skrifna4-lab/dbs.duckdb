@@ -5,26 +5,29 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import requests
 import duckdb
 
-# 🧱 CONFIGURACIÓN DE RUTA INTERNA FIJA ADENTRO DEL CONTENEDOR
+# 🧱 CONFIGURACIÓN DE RUTA INTERNA FIJA ADENTRO DEL CONTENEDOR DOCKER
 STORAGE_DIR = "/app/storage"
 DB_DIR = os.path.join(STORAGE_DIR, "databases")
 os.makedirs(DB_DIR, exist_ok=True)
 
-# 🔌 CREDENCIALES NATIVAS DE TU POSTGRESQL EN SUPABASE
-DB_HOST = "db"             # Alias DNS interno en la red de tu Dokploy
-DB_PORT = 5432
-DB_NAME = "postgres"
-DB_USER = "postgres"
-DB_PASS = "zsalrelray6q3olo41iqasxlswe6lszx"
+# 🔌 CREDENCIALES NATIVAS DE TU SUPABASE (VALIDADAS CON ÉXITO)
+SUPABASE_URL = "http://skrifna-supabase-473c9f-192-129-183-187.sslip.io"
+SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3ODEwMTQzOTksImV4cCI6MTg5MzQ1NjAwMCwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlzcyI6InN1cGFiYXNlIn0.L4hICENRSDn6FRSX1YDj0dxYrnmIjEPsieqvCW8VMj4"
 
-# Cadena de conexión estandarizada
-CONN_STR_POSTGRES = f"dbname={DB_NAME} user={DB_USER} password={DB_PASS} host={DB_HOST} port={DB_PORT}"
+# Headers maestros con firma válida para pasar los filtros de Kong
+HEADERS_SUPABASE = {
+    "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
+    "apiKey": SERVICE_ROLE_KEY,
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"  # Exige a Supabase que retorne objetos estructurados
+}
 
 app = FastAPI(title="SaaS Orchestrator Core API", version="3.0.0")
 
-# 🌍 APERTURA TOTAL DE CORS PARA TU INTERFAZ GRÁFICA CYBERPUNK
+# 🌍 APERTURA TOTAL DE CORS PARA TU FRONTEND HTML CYBERPUNK
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,58 +36,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def sincronizar_tablas_en_supabase():
-    """Inicializa automáticamente la estructura relacional de metadatos dentro de tu Supabase."""
-    try:
-        con = duckdb.connect(':memory:')
-        con.execute("INSTALL postgres; LOAD postgres;")
-        
-        # Tabla de cartas/bases de datos activas
-        con.execute(f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'CREATE TABLE IF NOT EXISTS metadata_dbs (nombre_db TEXT PRIMARY KEY, password_descarga TEXT, categoria TEXT, imagen TEXT, tabla_principal TEXT, total_registros BIGINT, peso_mb REAL, configurada BOOLEAN);')")
-        # Tabla de tokens de acceso individuales asignados por cliente
-        con.execute(f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'CREATE TABLE IF NOT EXISTS metadata_tokens (token TEXT PRIMARY KEY, usuario TEXT, database TEXT);')")
-        # Tabla de logs e historial de auditoría de conexiones globales
-        con.execute(f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'CREATE TABLE IF NOT EXISTS metadata_logs (id TEXT PRIMARY KEY, token TEXT, usuario TEXT, database TEXT, evento TEXT, fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP);')")
-        
-        con.close()
-        print("✅ Base de datos de Supabase sincronizada. Tablas de control listas.")
-    except Exception as e:
-        print(f"⚠️ Alerta en inicio al conectar con Supabase Postgres: {str(e)}")
-
-# Correr inicializador atómico al levantar el backend
-sincronizar_tablas_en_supabase()
-
 
 # =====================================================================
 # 📡 CANAL EXCLUSIVO: TRANSMISIÓN BINARIA ASÍNCRONA (HTTPFS DUCKDB)
 # =====================================================================
 @app.get("/api/stream/{token}/{db_name}")
 async def stream_database_httpfs(token: str, db_name: str):
-    """Soporta peticiones de rango HTTP. Permite a DuckDB httpfs consultar millones de filas en red."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    
-    # Validar el token directo en Supabase Postgres
-    token_check = con.execute(f"SELECT usuario, database FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_tokens') WHERE token = ?", [token]).fetchone()
-    
-    if not token_check:
-        con.close()
+    """Canal de comunicación asíncrono para tus bots externos. DuckDB httpfs consume este endpoint."""
+    # Consultar si el token existe consumiendo la API HTTP de Supabase (PostgREST)
+    url_token = f"{SUPABASE_URL}/rest/v1/metadata_tokens?token=eq.{token}&select=usuario,database"
+    try:
+        res_token = requests.get(url_token, headers=HEADERS_SUPABASE, timeout=10)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al conectar con Supabase Auth Link: {str(e)}")
+        
+    if res_token.status_code != 200 or not res_token.json():
         raise HTTPException(status_code=403, detail="Acceso denegado: Token invalido o revocado")
         
-    usuario, authorized_db = token_check[0], token_check[1]
+    token_data = res_token.json()[0]
+    usuario, authorized_db = token_data["usuario"], token_data["database"]
+    
     if authorized_db != db_name:
-        con.close()
-        raise HTTPException(status_code=403, detail="Acceso denegado: Token sin autorizacion para este archivo")
+        raise HTTPException(status_code=403, detail="Acceso denegado: Token no autorizado para este archivo")
         
     ruta_real = os.path.join(DB_DIR, db_name)
     if not os.path.exists(ruta_real):
-        con.close()
-        raise HTTPException(status_code=404, detail="El archivo binario solicitado no existe fisicamente en la ruta fija del contenedor")
+        raise HTTPException(status_code=404, detail="El archivo binario solicitado no existe en la ruta fija")
         
-    # Registrar log de auditoría en caliente directo en Supabase
-    log_id = str(uuid.uuid4())
-    con.execute(f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'INSERT INTO metadata_logs (id, token, usuario, database, evento) VALUES (''{log_id}'', ''{token}'', ''{usuario}'', ''{db_name}'', ''Peticion HTTPFS Exitosa'');')")
-    con.close()
+    # Registrar log de auditoría asíncrono directamente en tu Supabase remoto
+    log_payload = {"token": token, "usuario": usuario, "database": db_name, "evento": "Peticion HTTPFS Exitosa"}
+    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_logs", headers=HEADERS_SUPABASE, json=log_payload, timeout=5)
     
     return FileResponse(ruta_real, media_type="application/octet-stream", filename=db_name)
 
@@ -95,25 +76,26 @@ async def stream_database_httpfs(token: str, db_name: str):
 
 @app.get("/api/system/path")
 async def obtener_ruta_servidor():
-    """Retorna la ruta física absoluta para subir archivos pesados por SFTP sin adivinar."""
+    """Retorna la ruta física absoluta para el canal rápido SFTP/SSH."""
     return {
         "status": "success",
-        "explicacion": "Apunta tu cliente SFTP/SSH a esta ruta exacta de tu VPS para inyectar bases de datos gigantes",
+        "explicacion": "Apunta tu cliente SFTP/SSH a esta ruta exacta de tu VPS para inyectar archivos de forma directa",
         "ruta_vps_fija_absoluta": "/var/lib/docker/volumes/supabase_storage-api/_data/databases/"
     }
 
 
 @app.get("/api/database/scan")
 async def escanear_archivos_nuevos():
-    """🔍 ESCÁNER DE ARCHIVOS: Compara el disco contra Supabase y detecta bases de datos nuevas subidas por SFTP."""
+    """🔍 ESCÁNER DE ARCHIVOS: Compara el disco contra Supabase y detecta si hay archivos .duckdb nuevos huérfanos."""
     archivos_en_disco = [f for f in os.listdir(DB_DIR) if f.endswith('.duckdb')]
     
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    dbs_registradas = con.execute(f"SELECT nombre_db FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_dbs')").fetchall()
-    con.close()
+    # Consultar DBs registradas desde la API REST de Supabase
+    try:
+        res_dbs = requests.get(f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db", headers=HEADERS_SUPABASE, timeout=10)
+        lista_registradas = [r["nombre_db"] for r in res_dbs.json()] if res_dbs.status_code == 200 else []
+    except:
+        lista_registradas = []
     
-    lista_registradas = [r[0] for r in dbs_registradas]
     archivos_nuevos_sin_configurar = [arc for arc in archivos_en_disco if arc not in lista_registradas]
     
     return {
@@ -125,7 +107,7 @@ async def escanear_archivos_nuevos():
 
 @app.post("/api/database/upload-direct")
 async def subida_http_directa(file: UploadFile = File(...)):
-    """Soporta subidas HTTP directas para bases de datos estáticas más livianas."""
+    """Soporta subidas HTTP directas para archivos estáticos más livianos."""
     if not file.filename.endswith('.duckdb'):
         raise HTTPException(status_code=400, detail="Solo se aceptan archivos .duckdb")
     
@@ -133,7 +115,7 @@ async def subida_http_directa(file: UploadFile = File(...)):
     with open(ruta_destino, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    return {"status": "success", "message": f"Archivo {file.filename} inyectado por HTTP. Pasa a configurarlo."}
+    return {"status": "success", "message": f"Archivo {file.filename} inyectado por HTTP. Procede a configurarlo."}
 
 
 @app.post("/api/database/configure")
@@ -143,12 +125,12 @@ async def configurar_y_memorizar_db(
     categoria: str = Form("General"),
     imagen_url: str = Form("")
 ):
-    """📝 LINK DE CONFIGURACIÓN OBLIGATORIA: Analiza las tablas/filas de la base detectada y la publica en Supabase."""
+    """📝 LINK DE CONFIGURACIÓN OBLIGATORIA: Analiza las tablas/filas de la base detectada y publica la tarjeta en Supabase."""
     ruta_real = os.path.join(DB_DIR, nombre_db)
     if not os.path.exists(ruta_real):
         raise HTTPException(status_code=404, detail="El archivo binario no se encuentra en la carpeta física del disco")
 
-    # Extraer metadatos estructurales automáticos abriendo el archivo en frío por un milisegundo
+    # Extraer metadatos estructurales automáticos abriendo el archivo local de forma efímera
     tabla_detectada = "N/A"
     total_filas = 0
     try:
@@ -163,21 +145,26 @@ async def configurar_y_memorizar_db(
 
     peso_mb = round(os.path.getsize(ruta_real) / (1024 * 1024), 2)
 
-    # Insertar/Actualizar la configuración permanentemente en Supabase
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    query_insert = (
-        f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'INSERT INTO metadata_dbs "
-        f"(nombre_db, password_descarga, categoria, imagen, tabla_principal, total_registros, peso_mb, configurada) "
-        f"VALUES (''{nombre_db}'', ''{password_descarga}'', ''{categoria}'', ''{imagen_url}'', ''{tabla_detectada}'', {total_filas}, {peso_mb}, true) "
-        f"ON CONFLICT (nombre_db) DO UPDATE SET password_descarga=EXCLUDED.password_descarga, categoria=EXCLUDED.categoria, imagen=EXCLUDED.imagen, total_registros={total_filas}, peso_mb={peso_mb};')"
-    )
-    con.execute(query_insert)
-    con.close()
+    # Payload estructurado para PostgREST (Supabase) con Upsert nativo
+    db_payload = {
+        "nombre_db": nombre_db,
+        "password_descarga": password_descarga,
+        "categoria": categoria,
+        "imagen": imagen_url,
+        "tabla_principal": tabla_detectada,
+        "total_registros": total_filas,
+        "peso_mb": peso_mb,
+        "configurada": True
+    }
+    
+    # Hacemos el merge mediante HTTP Headers para resolver duplicados si se re-configura la tarjeta
+    headers_upsert = HEADERS_SUPABASE.copy()
+    headers_upsert["Resolution"] = "merge-duplicates"
+    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_dbs", headers=headers_upsert, json=db_payload, timeout=10)
 
     return {
         "status": "success",
-        "message": f"Base de datos '{nombre_db}' memorizada e indexada con éxito en Supabase",
+        "message": f"Base de datos '{nombre_db}' memorizada e indexada con éxito en tu Supabase",
         "analisis_estructural": {
             "tabla_maestra": tabla_detectada,
             "registros_totales": total_filas,
@@ -189,38 +176,22 @@ async def configurar_y_memorizar_db(
 @app.get("/api/database/list")
 async def listar_cartas_saas(categoria: Optional[str] = None):
     """Retorna todas las bases de datos registradas en formato JSON limpio para pintar tus tarjetas HTML."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    
-    query = f"SELECT nombre_db, categoria, imagen, tabla_principal, total_registros, peso_mb FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_dbs')"
-    records = con.execute(query).fetchall()
-    con.close()
-    
-    cartas = []
-    for r in records:
-        if categoria and r[1].lower() != categoria.lower():
-            continue
-        cartas.append({
-            "nombre_db": r[0],
-            "categoria": r[1],
-            "imagen": r[2],
-            "tabla_principal": r[3],
-            "total_registros": r[4],
-            "peso_mb": r[5]
-        })
+    url = f"{SUPABASE_URL}/rest/v1/metadata_dbs?select=nombre_db,categoria,imagen,tabla_principal,total_registros,peso_mb"
+    if categoria:
+        url += f"&categoria=ilike.{categoria}"
         
+    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    cartas = res.json() if res.status_code == 200 else []
     return {"status": "success", "total_cartas": len(cartas), "databases": cartas}
 
 
 @app.post("/api/database/console")
 async def ejecutar_comando_sql(nombre_db: str = Form(...), password: str = Form(...), query: str = Form(...)):
     """⚙️ ICONO CONFIGURACIÓN: Consola para ejecutar sentencias de optimización (Indices/Vacuum) en caliente."""
-    con_check = duckdb.connect(':memory:')
-    con_check.execute("INSTALL postgres; LOAD postgres;")
-    res = con_check.execute(f"SELECT password_descarga FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_dbs') WHERE nombre_db = ?", [nombre_db]).fetchone()
-    con_check.close()
+    url_check = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=password_descarga"
+    res_check = requests.get(url_check, headers=HEADERS_SUPABASE, timeout=10)
     
-    if not res or res[0] != password:
+    if res_check.status_code != 200 or not res_check.json() or res_check.json()[0]["password_descarga"] != password:
         raise HTTPException(status_code=401, detail="Contraseña de base de datos incorrecta")
         
     ruta_db = os.path.join(DB_DIR, nombre_db)
@@ -236,43 +207,36 @@ async def ejecutar_comando_sql(nombre_db: str = Form(...), password: str = Form(
 @app.get("/api/database/spider/{nombre_db}")
 async def araña_estructural(nombre_db: str):
     """🕷️ ICONO ARAÑA: Escanea y retorna las columnas y tipos de datos de la tabla interna de la tarjeta."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    res = con.execute(f"SELECT tabla_principal FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_dbs') WHERE nombre_db = ?", [nombre_db]).fetchone()
-    con.close()
+    url = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=tabla_principal"
+    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
     
-    if not res or res[0] == "N/A":
+    if res.status_code != 200 or not res.json() or res.json()[0]["tabla_principal"] == "N/A":
         return {"status": "success", "tabla": "N/A", "columnas": []}
         
-    tabla = res[0]
+    tabla = res.json()[0]["tabla_principal"]
     ruta_real = os.path.join(DB_DIR, nombre_db)
-    
     try:
         con_db = duckdb.connect(ruta_real, read_only=True)
         pragma_info = con_db.execute(f"PRAGMA table_info('{tabla}');").fetchall()
         con_db.close()
-        
-        columnas = [{"campo": c[1], "tipo": c[2]} for c in pragma_info]
-        return {"status": "success", "tabla": tabla, "columnas": columnas}
+        return {"status": "success", "tabla": tabla, "columnas": [{"campo": c[1], "tipo": c[2]} for c in pragma_info]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error mapeando mapa binario (Spider): {str(e)}")
 
 
 @app.post("/api/key/generate")
 async def generar_token_acceso(nombre_db: str = Form(...), password: str = Form(...), usuario: str = Form(...)):
-    """🔑 ICONO LLAVE: Valida credenciales de la tarjeta y guarda un nuevo token de consulta con CORS abierto."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
+    """🔑 ICONO LLAVE: Valida credenciales de la tarjeta y guarda un nuevo token de consulta en Supabase."""
+    url_check = f"{SUPABASE_URL}/rest/v1/metadata_dbs?nombre_db=eq.{nombre_db}&select=password_descarga"
+    res_check = requests.get(url_check, headers=HEADERS_SUPABASE, timeout=10)
     
-    pwd_check = con.execute(f"SELECT password_descarga FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_dbs') WHERE nombre_db = ?", [nombre_db]).fetchone()
-    
-    if not pwd_check or pwd_check[0] != password:
-        con.close()
+    if res_check.status_code != 200 or not res_check.json() or res_check.json()[0]["password_descarga"] != password:
         raise HTTPException(status_code=401, detail="Contraseña de la base de datos incorrecta")
         
     nuevo_token = f"tkn_{uuid.uuid4().hex[:16]}"
-    con.execute(f"CALL postgres_execute('{CONN_STR_POSTGRES}', 'INSERT INTO metadata_tokens (token, usuario, database) VALUES (''{nuevo_token}'', ''{usuario}'', ''{nombre_db}'');')")
-    con.close()
+    token_payload = {"token": nuevo_token, "usuario": usuario, "database": nombre_db}
+    
+    requests.post(f"{SUPABASE_URL}/rest/v1/metadata_tokens", headers=HEADERS_SUPABASE, json=token_payload, timeout=10)
     
     return {
         "status": "success",
@@ -286,26 +250,25 @@ async def generar_token_acceso(nombre_db: str = Form(...), password: str = Form(
 @app.get("/api/key/users/{nombre_db}")
 async def ver_usuarios_permitidos(nombre_db: str):
     """👥 PESTAÑA USUARIOS: Retorna el array JSON de todos los clientes autorizados de esta tarjeta."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    records = con.execute(f"SELECT usuario, token FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_tokens') WHERE database = ?", [nombre_db]).fetchall()
-    con.close()
+    url = f"{SUPABASE_URL}/rest/v1/metadata_tokens?database=eq.{nombre_db}&select=usuario,token"
+    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    records = res.json() if res.status_code == 200 else []
     
-    usuarios = [{"usuario": r[0], "token_key": r[1]} for r in records]
+    usuarios = [{"usuario": r["usuario"], "token_key": r["token"]} for r in records]
     return {"status": "success", "database": nombre_db, "usuarios_autorizados": usuarios}
 
 
 @app.get("/api/network/logs")
 async def ver_logs_trafico_red():
-    """📡 BARRA SUPERIOR (CONEXIONES): Devuelve el registro de auditoría en red directamente de Supabase."""
-    con = duckdb.connect(':memory:')
-    con.execute("INSTALL postgres; LOAD postgres;")
-    records = con.execute(f"SELECT token, usuario, database, evento, fecha FROM postgres_scan('{CONN_STR_POSTGRES}', 'public', 'metadata_logs') ORDER BY fecha DESC LIMIT 15").fetchall()
-    con.close()
+    """📡 BARRA SUPERIOR (CONEXIONES): Devuelve el registro de auditoría en red directamente de tu Supabase."""
+    url = f"{SUPABASE_URL}/rest/v1/metadata_logs?select=token,usuario,database,evento,fecha&order=fecha.desc&limit=15"
+    res = requests.get(url, headers=HEADERS_SUPABASE, timeout=10)
+    records = res.json() if res.status_code == 200 else []
     
-    logs = [{"token": r[0], "usuario": r[1], "database": r[2], "evento": r[3], "timestamp": str(r[4])} for r in records]
+    logs = [{"token": r["token"], "usuario": r["usuario"], "database": r["database"], "evento": r["evento"], "timestamp": r["fecha"]} for r in records]
     return {"status": "success", "total_peticiones_recientes": len(logs), "conexiones_logs": logs}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8020)
+    # Correr en el puerto 8000 mapeado en Dokploy
+    uvicorn.run(app, host="0.0.0.0", port=8000)
