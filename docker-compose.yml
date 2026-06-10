@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  orchestrator:
+    build: .
+    container_name: orchestrator-core
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      - PORT=8000
+    volumes:
+      # Volumen persistente donde viven TODOS los archivos .duckdb
+      # Los datos sobreviven reinicios, redeployments y rebuilds
+      - duckdb_storage:/app/storage/databases
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# Declaración del volumen con nombre
+# Docker lo gestiona automáticamente en: /var/lib/docker/volumes/orchestrator_duckdb_storage/
+volumes:
+  duckdb_storage:
+    driver: local
